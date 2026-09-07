@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nandmorphic — NAND Circuit Playground</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="toolbar">
+      <div class="brand">
+        <span class="logo">N</span>
+        <span class="title">nandmorphic</span>
+      </div>
+
+      <div class="tool-group">
+        <button class="btn" data-action="add-input" title="Add input node (I)">+ Input</button>
+        <button class="btn" data-action="add-output" title="Add output node (O)">+ Output</button>
+        <button class="btn" data-action="add-nand" title="Add NAND gate (N)">+ NAND</button>
+      </div>
+
+      <div class="tool-group">
+        <button class="btn" data-action="encapsulate" title="Wrap selection into a custom node (E)">Encapsulate</button>
+        <button class="btn" data-action="open-node" title="Open selected custom node (double-click)">Open Node</button>
+        <button class="btn" data-action="up-level" title="Go up one level (Esc)">Up Level</button>
+        <button class="btn" data-action="delete" title="Delete selected nodes (Delete)">Delete</button>
+      </div>
+
+      <div class="tool-group">
+        <button class="btn" data-action="mode" id="mode-btn" title="Toggle run/develop mode">Run: Play</button>
+      </div>
+
+      <div class="tool-group">
+        <button class="btn" data-action="clock" id="clock-btn" title="Advance clock (Space)">Clock</button>
+        <span class="status" id="clock-counter">clk 0</span>
+        <label for="clkfreq-range" style="color:var(--text-dim);font-size:12px;margin-left:4px">Hz</label>
+        <input type="range" id="clkfreq-range" min="1" max="20" value="6" title="Clock frequency in Run mode (Hz)" style="width:90px;accent-color:var(--accent)" />
+        <span class="status" id="clkfreq-label" style="min-width:18px">6</span>
+      </div>
+
+      <div class="tool-group">
+        <button class="btn" data-action="export" title="Download workspace JSON (Ctrl+Shift+S)">Export</button>
+        <button class="btn" data-action="import" title="Import workspace JSON">Import</button>
+        <input type="file" id="import-file" accept=".json,application/json" style="display:none" />
+      </div>
+
+      <div class="tool-group">
+        <span class="status" id="status">idle</span>
+      </div>
+    </header>
+
+    <div id="main">
+      <aside id="palette">
+        <div class="palette-header">Library</div>
+        <div id="library-list"></div>
+      </aside>
+
+      <div id="workspace">
+        <div id="tabs"></div>
+        <div id="canvas-wrap">
+          <canvas id="canvas"></canvas>
+          <div id="hint"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-root"></div>
+
+  <script type="module" src="js/main.js?v=B4"></script>
+</body>
+</html>
