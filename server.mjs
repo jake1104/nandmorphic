@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 
 const PORT = process.env.PORT || 8791;
-const ROOT = process.cwd();
+const ROOT = path.join(process.cwd(), 'dist');
 const types = { '.html':'text/html','.css':'text/css','.js':'text/javascript','.json':'application/json','.png':'image/png' };
 
 const server = http.createServer((req, res) => {

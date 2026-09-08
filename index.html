@@ -40,6 +40,16 @@
         <span class="status" id="clkfreq-label" style="min-width:18px">6</span>
       </div>
 
+      <div class="tool-group zoom-group">
+        <button class="btn" data-action="zoom-out" title="Zoom out (-)">−</button>
+        <button class="btn" data-action="fit-all" title="Fit all nodes in view (F)">Fit</button>
+        <button class="btn" data-action="zoom-in" title="Zoom in (+)">+</button>
+      </div>
+
+      <div class="tool-group">
+        <button class="btn" id="theme-btn" data-action="theme" title="Toggle light/dark theme">Light</button>
+      </div>
+
       <div class="tool-group">
         <button class="btn" data-action="export" title="Download workspace JSON (Ctrl+Shift+S)">Export</button>
         <button class="btn" data-action="import" title="Import workspace JSON">Import</button>
@@ -69,6 +79,6 @@
 
   <div id="modal-root"></div>
 
-  <script type="module" src="js/main.js?v=B4"></script>
+  <script type="module" src="js/main.js?v=B7"></script>
 </body>
 </html>

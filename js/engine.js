@@ -3,8 +3,8 @@
 // - Sequential logic (feedback loops): only updates on clock edge
 // - No PULSE node; INPUT nodes are level-sensitive
 
-import { NodeKind, makeId } from './model.js?v=B4';
-import { buildSignatureForCustom, canonicalSignature } from './optimizer.js?v=B4';
+import { NodeKind, makeId } from './model.js';
+import { buildSignatureForCustom, canonicalSignature } from './optimizer.js';
 
 export const Mode = { DEV: 'dev', RUN: 'run' };
 
@@ -165,6 +165,19 @@ export class Engine {
     [ids[i], ids[j]] = [ids[j], ids[i]];
     const rebuilt = new Map();
     for (const id of ids) rebuilt.set(id, this.definitions.get(id));
+    this.definitions = rebuilt;
+    this.bump();
+    return true;
+  }
+  // Reorder the definitions map to match the given id order (for drag reorder).
+  reorderDefinitions(ids) {
+    const rebuilt = new Map();
+    for (const id of ids) {
+      const d = this.definitions.get(id);
+      if (d) rebuilt.set(id, d);
+    }
+    for (const [id, d] of this.definitions) if (!rebuilt.has(id)) rebuilt.set(id, d);
+    if (rebuilt.size !== this.definitions.size) return false;
     this.definitions = rebuilt;
     this.bump();
     return true;
@@ -411,14 +424,55 @@ export class Engine {
     const signature = buildSignatureForCustom(circuit, this.definitions);
     const canon = canonicalSignature(signature, circuit);
     for (const [, def] of this.definitions) if (def.canonical === canon) return def;
+    return this.createDefinition(circuit, name, signature, canon);
+  }
+  // Always allocate a new definition id for `circuit` (no dedup).
+  createDefinition(circuit, name, signature, canon) {
+    const sig = signature || buildSignatureForCustom(circuit, this.definitions);
+    const canonical = canon || canonicalSignature(sig, circuit);
     const ticks = computeTicksForCircuit(circuit, this.definitions);
-    const def = { id: makeId('def'), name: name || 'custom', signature, canonical: canon, inputs: signature.inputCount, outputs: signature.outputCount, circuit, ticks };
+    const def = { id: makeId('def'), name: name || 'custom', signature: sig, canonical, inputs: sig.inputCount, outputs: sig.outputCount, circuit, ticks };
     this.definitions.set(def.id, def);
+    this.bump();
+    return def;
+  }
+  // Replace a definition's stored circuit wholesale (structure + layout) and
+  // recompute its derived data. Used when committing edits whose behavior is
+  // unchanged but whose structure differs — merging into the old circuit
+  // would silently drop added nodes, rewires, renames, etc.
+  replaceDefinitionCircuit(defId, circuit) {
+    const def = this.definitions.get(defId);
+    if (!def) return null;
+    const signature = buildSignatureForCustom(circuit, this.definitions);
+    def.circuit = circuit;
+    def.signature = signature;
+    def.canonical = canonicalSignature(signature, circuit);
+    def.inputs = signature.inputCount;
+    def.outputs = signature.outputCount;
+    def.ticks = computeTicksForCircuit(circuit, this.definitions);
     this.bump();
     return def;
   }
   instantiate(def, x, y) {
     return this.addNode(NodeKind.CUSTOM, x, y, { ref: def.id, name: def.name, inputNames: portNamesOfDef(def, 'in'), outputNames: portNamesOfDef(def, 'out') });
+  }
+  // Overwrite a definition's stored node positions with the layout of `circuit`.
+  // Used when committing edited internals, because registerDefinition may dedupe
+  // to an existing definition (positions aren't part of the behavioral
+  // signature) and would otherwise keep the old layout.
+  setDefinitionLayout(defId, circuit) {
+    const def = this.definitions.get(defId);
+    if (!def || !def.circuit || !circuit || !circuit.nodes) return false;
+    const byId = new Map(circuit.nodes.map((n) => [n.id, n]));
+    for (const cn of def.circuit.nodes) {
+      const m = byId.get(cn.id);
+      if (m && Number.isFinite(m.x) && Number.isFinite(m.y)) {
+        cn.x = m.x;
+        cn.y = m.y;
+      }
+    }
+    this.bump();
+    return true;
   }
   getNodes() { return Array.from(this.nodes.values()); }
   getDefinitions() { return Array.from(this.definitions.values()); }
@@ -433,7 +487,8 @@ export class Engine {
     const circuit = def.circuit || { nodes: [], edges: [] };
     const pos = layoutCircuit(circuit);
     for (const cn of circuit.nodes) {
-      const p = pos.get(cn.id) || { x: 160 + Math.random() * 40, y: 160 + Math.random() * 40 };
+      const laid = pos.get(cn.id) || { x: 160 + Math.random() * 40, y: 160 + Math.random() * 40 };
+      const p = (Number.isFinite(cn.x) && Number.isFinite(cn.y)) ? { x: cn.x, y: cn.y } : laid;
       if (cn.kind === 'input') this.addNode(NodeKind.INPUT, p.x, p.y, { id: cn.id, value: cn.value | 0, name: cn.name || '' });
       else if (cn.kind === 'output') this.addNode(NodeKind.OUTPUT, p.x, p.y, { id: cn.id, name: cn.name || '' });
       else if (cn.kind === 'nand') this.addNode(NodeKind.NAND, p.x, p.y, { id: cn.id, name: cn.name || '' });
@@ -563,6 +618,29 @@ export class Engine {
 function ensureNames(arr, n) {
   const a = (arr && arr.length === n) ? arr.slice() : new Array(n).fill('');
   while (a.length < n) a.push(''); return a;
+}
+
+// Compare two definition circuits structurally, ignoring node positions.
+// Used on commit: behavior-only dedup must not discard structural edits
+// (added/removed nodes, rewired edges, renames, port changes, input values).
+export function sameCircuitStructure(a, b) {
+  const strip = (c) => {
+    const nodes = ((c && c.nodes) || []).map((n) => ({
+      id: n.id, kind: n.kind,
+      inputIndex: n.inputIndex | 0, outputIndex: n.outputIndex | 0,
+      ref: n.ref || null, name: n.name || '', value: n.value | 0,
+    })).sort((p, q) => (p.id < q.id ? -1 : p.id > q.id ? 1 : 0));
+    const edges = ((c && c.edges) || []).map((e) => ({
+      from: e.from, to: e.to, port: e.port | 0, srcPort: e.srcPort | 0,
+    })).sort((p, q) => {
+      const s = `${p.from}>${p.to}:${p.port}:${p.srcPort}`;
+      const t = `${q.from}>${q.to}:${q.port}:${q.srcPort}`;
+      return s < t ? -1 : s > t ? 1 : 0;
+    });
+    const ports = (c && c.ports) || { inputs: [], outputs: [] };
+    return { nodes, edges, ports: { inputs: ports.inputs || [], outputs: ports.outputs || [] } };
+  };
+  return JSON.stringify(strip(a)) === JSON.stringify(strip(b));
 }
 
 function portNamesOfDef(def, dir) {

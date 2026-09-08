@@ -1,10 +1,10 @@
 // Main entry point: wires engine, renderer, interactor, and UI.
 
-import { Engine } from './engine.js?v=B4';
-import { draw } from './renderer.js?v=B4';
-import { Interactor } from './interact.js?v=B4';
-import { NodeKind } from './model.js?v=B4';
-import { buildDefinitionFromCircuit } from './encapsulate.js?v=B4';
+import { Engine, sameCircuitStructure } from './engine.js';
+import { draw } from './renderer.js';
+import { Interactor } from './interact.js';
+import { NodeKind } from './model.js';
+import { buildDefinitionFromCircuit } from './encapsulate.js';
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
@@ -14,7 +14,7 @@ const modalRoot = document.getElementById('modal-root');
 const hintEl = document.getElementById('hint');
 
 const engine = new Engine();
-const view = { x: 0, y: 0 };
+const view = { x: 0, y: 0, zoom: 1 };
 
 let interactor;
 
@@ -61,9 +61,65 @@ function initInteractor() {
   window.addEventListener('pointerup', (e) => { if (interactor) interactor.onPointerUp(e); });
 }
 
+// ---- Zoom / Pan ----
+function zoomAt(sx, sy, factor) {
+  const wx = sx / view.zoom + view.x;
+  const wy = sy / view.zoom + view.y;
+  view.zoom = Math.max(0.1, Math.min(5, view.zoom * factor));
+  view.x = wx - sx / view.zoom;
+  view.y = wy - sy / view.zoom;
+  render();
+}
+
+function zoomIn() {
+  const wrap = document.getElementById('canvas-wrap');
+  zoomAt(wrap.clientWidth / 2, wrap.clientHeight / 2, 1.25);
+}
+
+function zoomOut() {
+  const wrap = document.getElementById('canvas-wrap');
+  zoomAt(wrap.clientWidth / 2, wrap.clientHeight / 2, 0.8);
+}
+
+function fitAll() {
+  const nodes = engine.getNodes();
+  if (nodes.length === 0) { view.x = 0; view.y = 0; view.zoom = 1; render(); return; }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x - 60);
+    minY = Math.min(minY, n.y - 40);
+    maxX = Math.max(maxX, n.x + 60);
+    maxY = Math.max(maxY, n.y + 40);
+  }
+  const wrap = document.getElementById('canvas-wrap');
+  const cw = wrap.clientWidth;
+  const ch = wrap.clientHeight;
+  const gw = maxX - minX;
+  const gh = maxY - minY;
+  const padding = 60;
+  view.zoom = Math.min(2, Math.min((cw - padding * 2) / gw, (ch - padding * 2) / gh));
+  view.zoom = Math.max(0.1, view.zoom);
+  view.x = (minX + maxX) / 2 - cw / (2 * view.zoom);
+  view.y = (minY + maxY) / 2 - ch / (2 * view.zoom);
+  render();
+}
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const factor = e.deltaY < 0 ? 1.1 : 0.9;
+  zoomAt(sx, sy, factor);
+}, { passive: false });
+
+canvas.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+
 function addNode(kind) {
-  const cx = view.x + (canvas.clientWidth || 600) / 2 + (Math.random() * 40 - 20);
-  const cy = view.y + (canvas.clientHeight || 400) / 2 + (Math.random() * 40 - 20);
+  const cw = canvas.clientWidth || 600;
+  const ch = canvas.clientHeight || 400;
+  const cx = cw / 2 / view.zoom + view.x + (Math.random() * 40 - 20);
+  const cy = ch / 2 / view.zoom + view.y + (Math.random() * 40 - 20);
   engine.addNode(kind, cx, cy);
   setStatus(`added ${kind}`);
   render();
@@ -114,6 +170,7 @@ function levelTitle(i) {
 
 function saveCurrentLevel() {
   levels[activeLevel].json = engine.toJSON();
+  levels[activeLevel].viewState = { x: view.x, y: view.y, zoom: view.zoom };
   levels[activeLevel].dirty = false;
 }
 
@@ -135,12 +192,21 @@ function switchToLevel(i) {
     if (isLevelDirty()) levels[activeLevel].dirty = true;
     commitLevel();
     activeLevel--;
+    // Reload the parent snapshot: the next commitLevel (if any) must operate
+    // on the parent's nodes, not the just-committed child's nodes.
+    engine.fromJSON(levels[activeLevel].json);
   }
   activeLevel = i;
   if (levels[i].json) engine.fromJSON(levels[i].json);
   else engine.fromJSON({ version: 2, mode: engine.mode, definitions: [], nodes: [] });
   interactor.selection.clear();
-  view.x = 0; view.y = 0;
+  if (levels[i].viewState) {
+    view.x = levels[i].viewState.x;
+    view.y = levels[i].viewState.y;
+    view.zoom = levels[i].viewState.zoom;
+  } else {
+    view.x = 0; view.y = 0; view.zoom = 1;
+  }
   refresh();
 }
 
@@ -151,7 +217,24 @@ function commitLevel() {
   const f = levels[activeLevel];
   const originalDef = f.containerRef ? engine.definitions.get(f.containerRef) : null;
   const circuit = buildDefinitionFromCircuit(engine, engine.getNodes().map((n) => n.id));
-  const newDef = engine.registerDefinition(circuit, originalDef ? originalDef.name : 'custom');
+  const defName = originalDef ? originalDef.name : 'custom';
+  let newDef = engine.registerDefinition(circuit, defName);
+  if (newDef.circuit !== circuit && !sameCircuitStructure(newDef.circuit, circuit)) {
+    // Same behavior but different structure (added/removed nodes, rewired
+    // edges, renames, port changes, ...). Dedup-merging would silently discard
+    // those edits on re-enter, so keep the edited structure instead.
+    if (originalDef && newDef.id === originalDef.id) {
+      engine.replaceDefinitionCircuit(originalDef.id, circuit);
+      newDef = engine.definitions.get(originalDef.id);
+    } else {
+      // Dedup hit a *different* definition: must not rewrite it.
+      newDef = engine.createDefinition(circuit, defName);
+    }
+  } else {
+    // registerDefinition may dedupe to an existing definition; make sure the
+    // (possibly shared) stored layout reflects what was just edited.
+    engine.setDefinitionLayout(newDef.id, circuit);
+  }
   // Apply the (possibly deduped) result to ALL instances.
   // The parent level's instances are in its saved JSON, not in the current engine.
   // Update the parent level's JSON to point to the new definition.
@@ -198,10 +281,9 @@ function down(node) {
   levels.push({ json: null, containerRef: node.ref, instanceId: node.id, dirty: false });
   activeLevel = levels.length - 1;
   engine.expandDefinition(def);
-  // Save the initial state of this new level AFTER expansion
-  saveCurrentLevel();
   interactor.selection.clear();
-  view.x = 0; view.y = 0;
+  view.x = 0; view.y = 0; view.zoom = 1;
+  saveCurrentLevel();
   refresh();
   setStatus(`editing internals of '${def.name}'`);
 }
@@ -213,7 +295,13 @@ function up() {
   activeLevel--;
   engine.fromJSON(levels[activeLevel].json);
   interactor.selection.clear();
-  view.x = 0; view.y = 0;
+  if (levels[activeLevel].viewState) {
+    view.x = levels[activeLevel].viewState.x;
+    view.y = levels[activeLevel].viewState.y;
+    view.zoom = levels[activeLevel].viewState.zoom;
+  } else {
+    view.x = 0; view.y = 0; view.zoom = 1;
+  }
   refresh();
 }
 
@@ -225,10 +313,19 @@ function goToLevel(i) {
     commitLevel();
     levels.pop();
     activeLevel--;
+    // Reload the parent snapshot: the next commitLevel (if any) must operate
+    // on the parent's nodes, not the just-committed child's nodes.
+    engine.fromJSON(levels[activeLevel].json);
   }
   engine.fromJSON(levels[i].json);
   interactor.selection.clear();
-  view.x = 0; view.y = 0;
+  if (levels[i].viewState) {
+    view.x = levels[i].viewState.x;
+    view.y = levels[i].viewState.y;
+    view.zoom = levels[i].viewState.zoom;
+  } else {
+    view.x = 0; view.y = 0; view.zoom = 1;
+  }
   refresh();
 }
 
@@ -296,16 +393,6 @@ function inspectNode(node) {
         if (row) row.name = el.value;
       };
     });
-    host.querySelectorAll('button[data-move]').forEach((el) => {
-      el.onclick = (e) => {
-        const arr = el.dataset.dir === 'in' ? inRows : outRows;
-        const i = +el.dataset.row, j = i + (+el.dataset.move);
-        if (j < 0 || j >= arr.length) return;
-        [arr[i], arr[j]] = [arr[j], arr[i]];
-        renderRows();
-        if (e && e.currentTarget) e.currentTarget.blur();
-      };
-    });
   };
   modalRoot.classList.add('open');
   modalRoot.innerHTML = `
@@ -317,10 +404,19 @@ function inspectNode(node) {
       <div class="actions">
         ${isCustom ? '<button class="btn" id="modal-open">Open Internals</button>' : ''}
         <button class="btn" id="modal-cancel">Cancel</button>
-        <button class="btn" id="modal-ok" style="background:var(--accent);color:#0d1117;border-color:var(--accent)">OK</button>
+        <button class="btn" id="modal-ok" style="background:var(--accent);color:var(--on-accent);border-color:var(--accent)">OK</button>
       </div>
     </div>`;
   renderRows();
+  enableDragReorder(document.getElementById('insp-ports'), '.port-row', (items) => {
+    const dir = items.length ? items[0].dataset.dir : 'in';
+    const order = items.map((it) => +it.dataset.row).filter((n) => !Number.isNaN(n));
+    const arr = dir === 'in' ? inRows : outRows;
+    if (order.length !== arr.length) return;
+    const next = order.map((k) => arr[k]);
+    for (let i = 0; i < arr.length; i++) arr[i] = next[i];
+    renderRows();
+  });
   document.getElementById('modal-cancel').onclick = closeModal;
   const openBtn = document.getElementById('modal-open');
   if (openBtn) openBtn.onclick = () => { closeModal(); const cur = engine.nodes.get(n.id); if (cur) openCustomNode(cur); };
@@ -371,8 +467,7 @@ function renderPortRows(dir, rows) {
       <div class="port-row">
         <span class="port-idx">${i}</span>
         <input type="text" data-dir="${dir}" data-row="${i}" value="${escapeHtml(row.name || '')}" placeholder="name" />
-        ${reorder ? `<button class="btn port-move" data-dir="${dir}" data-row="${i}" data-move="-1" title="Move port up">▲</button>
-        <button class="btn port-move" data-dir="${dir}" data-row="${i}" data-move="1" title="Move port down">▼</button>` : ''}
+        ${reorder ? `<span class="drag-handle" data-dir="${dir}" data-row="${i}" title="Drag to reorder">⠿</span>` : ''}
       </div>`).join('') + `</div>`;
 }
 
@@ -434,7 +529,6 @@ function renderLibrary() {
   const containerRef = activeLevel > 0 ? (levels[activeLevel] && levels[activeLevel].containerRef) : null;
   const insertable = containerRef ? new Set(engine.insertableDefinitions(containerRef).map((d) => d.id)) : new Set(allDefs.map((d) => d.id));
   const defs = allDefs;
-  const colors = { [NodeKind.CUSTOM]: '#d2a8ff' };
   for (const d of defs) {
     const item = document.createElement('div');
     item.className = 'lib-item';
@@ -443,17 +537,19 @@ function renderLibrary() {
     if (blocked) item.classList.add('blocked');
     const ticksLabel = d.ticks != null ? ` · ${d.ticks}t` : '';
     item.innerHTML = `
-      <div class="chip" style="background:#d2a8ff">c</div>
+      <div class="chip" style="background:var(--custom)">c</div>
       <div class="meta">
         <div class="name">${escapeHtml(d.name)}</div>
         <div class="desc">${d.inputs}→${d.outputs}${ticksLabel} · ${d.signature.bits.join(' ')}${blocked ? ' · would cycle' : ''}</div>
       </div>
-      <span class="lib-move" data-move="-1" title="Move up">▲</span><span class="lib-move" data-move="1" title="Move down">▼</span>
-      <span class="lib-del" data-del="${d.id}" title="Delete this custom node">✕</span>`;
+      <span class="lib-del" data-del="${d.id}" title="Delete this custom node">✕</span>
+      <span class="drag-handle" title="Drag to reorder">⠿</span>`;
     item.addEventListener('click', () => {
       if (blocked) { setStatus(`cannot insert '${d.name}': would create a cycle`); return; }
-      const cx = view.x + (canvas.clientWidth || 600) / 2;
-      const cy = view.y + (canvas.clientHeight || 400) / 2;
+      const cw = canvas.clientWidth || 600;
+      const ch = canvas.clientHeight || 400;
+      const cx = cw / 2 / view.zoom + view.x;
+      const cy = ch / 2 / view.zoom + view.y;
       engine.instantiate(d, cx + Math.random() * 40, cy + Math.random() * 40);
       render();
       setStatus(`added '${d.name}'`);
@@ -463,16 +559,17 @@ function renderLibrary() {
       e.stopPropagation();
       deleteDefinition(d);
     });
-    item.querySelectorAll('.lib-move').forEach((mv) => {
-      mv.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (engine.moveDefinition(d.id, +mv.dataset.move)) {
-          renderLibrary();
-          setStatus(`moved '${d.name}'`);
-        }
-      });
-    });
     libraryEl.appendChild(item);
+  }
+  if (!libraryEl.dataset.dragWired) {
+    libraryEl.dataset.dragWired = '1';
+    enableDragReorder(libraryEl, '.lib-item', (items) => {
+      const ids = items.map((it) => it.dataset.id).filter(Boolean);
+      if (engine.reorderDefinitions(ids)) {
+        renderLibrary();
+        setStatus('library reordered');
+      }
+    });
   }
   if (defs.length === 0) {
     libraryEl.innerHTML = '<div class="desc" style="padding:8px;color:var(--text-dim)">No custom nodes yet.<br/>Build a circuit, select it, press Encapsulate.</div>';
@@ -480,6 +577,68 @@ function renderLibrary() {
 }
 
 function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+// Drag-to-reorder: enableDragReorder(container, itemSel, onDone)
+// Dragging the ⠿ handle on an item of itemSel (scoped to its direct parent)
+// live-reorders the DOM; onDone(items) receives the items in their new order.
+function enableDragReorder(container, itemSel, onDone) {
+  let drag = null;
+  const suppressClick = (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    container.removeEventListener('click', suppressClick, true);
+  };
+  const finish = () => {
+    if (!drag) return;
+    drag.el.classList.remove('dragging');
+    drag.el.style.pointerEvents = '';
+    container.removeEventListener('click', suppressClick, true);
+    drag = null;
+  };
+  container.addEventListener('pointerdown', (e) => {
+    const handle = e.target && e.target.closest ? e.target.closest('.drag-handle') : null;
+    if (!handle || !container.contains(handle)) return;
+    const el = handle.closest(itemSel);
+    if (!el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    container.addEventListener('click', suppressClick, true);
+    drag = { el };
+    el.classList.add('dragging');
+    el.style.pointerEvents = 'none';
+    try { el.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+  });
+  container.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const parent = drag.el.parentElement;
+    if (!parent) return;
+    const over = document.elementFromPoint(e.clientX, e.clientY);
+    let target = over && over.closest(itemSel);
+    const siblings = [...parent.querySelectorAll(itemSel)];
+    if (!target || !siblings.includes(target)) {
+      if (!siblings.length) return;
+      const first = siblings[0].getBoundingClientRect();
+      const last = siblings[siblings.length - 1].getBoundingClientRect();
+      if (e.clientY < first.top + first.height / 2) target = siblings[0];
+      else if (e.clientY > last.bottom - last.height / 2) target = siblings[siblings.length - 1];
+      else return;
+    }
+    if (!target || target === drag.el || target.parentElement !== parent) return;
+    const tb = target.getBoundingClientRect();
+    const before = e.clientY < tb.top + tb.height / 2;
+    if (before) parent.insertBefore(drag.el, target);
+    else parent.insertBefore(drag.el, target.nextSibling);
+  });
+  container.addEventListener('pointerup', (e) => {
+    if (!drag) return;
+    e.stopPropagation();
+    const parent = drag.el.parentElement;
+    const items = parent ? [...parent.querySelectorAll(itemSel)] : [];
+    finish();
+    if (onDone) onDone(items);
+  });
+  container.addEventListener('pointercancel', finish);
+}
 
 function showNameModal(title, defaultName, onOk) {
   modalRoot.classList.add('open');
@@ -489,7 +648,7 @@ function showNameModal(title, defaultName, onOk) {
       <input type="text" id="name-input" value="${escapeHtml(defaultName)}" autofocus />
       <div class="actions">
         <button class="btn" id="modal-cancel">Cancel</button>
-        <button class="btn" id="modal-ok" style="background:var(--accent);color:#0d1117;border-color:var(--accent)">OK</button>
+        <button class="btn" id="modal-ok" style="background:var(--accent);color:var(--on-accent);border-color:var(--accent)">OK</button>
       </div>
     </div>`;
   const input = document.getElementById('name-input');
@@ -509,9 +668,9 @@ function showDirtyCloseModal(levelIndex) {
       <h3>Unsaved Changes</h3>
       <p>You have unsaved changes in <strong>${escapeHtml(levelTitle(levelIndex))}</strong>.</p>
       <div class="actions" style="gap: 8px; flex-wrap: wrap;">
-        <button class="btn" id="dirty-save-close" style="background:var(--accent-2);color:#0d1117;border-color:var(--accent-2)">Save and Close</button>
+        <button class="btn" id="dirty-save-close" style="background:var(--accent-2);color:var(--on-accent);border-color:var(--accent-2)">Save and Close</button>
         <button class="btn" id="dirty-discard-close">Close without Saving</button>
-        <button class="btn" id="dirty-cancel" style="background:var(--accent);color:#0d1117;border-color:var(--accent)">Return to Edit</button>
+        <button class="btn" id="dirty-cancel" style="background:var(--accent);color:var(--on-accent);border-color:var(--accent)">Return to Edit</button>
       </div>
     </div>`;
   document.getElementById('dirty-save-close').onclick = () => {
@@ -523,7 +682,7 @@ function showDirtyCloseModal(levelIndex) {
       activeLevel--;
       engine.fromJSON(levels[activeLevel].json);
       interactor.selection.clear();
-      view.x = 0; view.y = 0;
+      view.x = 0; view.y = 0; view.zoom = 1;
       refresh();
     } else {
       closeToLevel(levelIndex - 1);
@@ -608,10 +767,10 @@ function importWorkspace(file) {
       const data = JSON.parse(reader.result);
       engine.fromJSON(data);
       levels.length = 0;
-      levels.push({ json: engine.toJSON(), containerRef: null, instanceId: null, dirty: false });
+      levels.push({ json: engine.toJSON(), viewState: { x: 0, y: 0, zoom: 1 }, containerRef: null, instanceId: null, dirty: false });
       activeLevel = 0;
       interactor.selection.clear();
-      view.x = 0; view.y = 0;
+      view.x = 0; view.y = 0; view.zoom = 1;
       renderLibrary();
       renderTabs();
       updateToolbar();
@@ -624,14 +783,37 @@ function importWorkspace(file) {
   reader.readAsText(file);
 }
 
+// Theme (dark default, light optional)
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem('nandmorphic-theme', theme); } catch (e) {}
+  const themeBtn = document.getElementById('theme-btn');
+  if (themeBtn) {
+    themeBtn.textContent = theme === 'light' ? 'Dark' : 'Light';
+    themeBtn.title = theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+  }
+}
+try {
+  applyTheme(localStorage.getItem('nandmorphic-theme') === 'light' ? 'light' : 'dark');
+} catch (e) {
+  applyTheme('dark');
+}
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+}
+
 // Toolbar wiring
 document.querySelectorAll('[data-action]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const a = btn.dataset.action;
     if (a === 'mode') return toggleMode();
+    if (a === 'theme') return toggleTheme();
     if (a === 'clock') return doClock();
     if (a === 'export') return exportWorkspace();
     if (a === 'import') return document.getElementById('import-file').click();
+    if (a === 'zoom-in') return zoomIn();
+    if (a === 'zoom-out') return zoomOut();
+    if (a === 'fit-all') return fitAll();
     // everything else is an editing action: blocked in run mode
     if (engine.mode === 'run' && a !== 'clock') return;
     if (a === 'add-input') addNode(NodeKind.INPUT);
@@ -684,6 +866,9 @@ window.addEventListener('keydown', (e) => {
     if (activeLevel > 0 && interactor.selection.size === 0) { up(); }
     else { interactor.selection.clear(); interactor.emitSelection(); updateToolbar(); render(); }
   }
+  else if (e.key === '=' || e.key === '+') { zoomIn(); }
+  else if (e.key === '-') { zoomOut(); }
+  else if (e.key.toLowerCase() === 'f' && !mod) { fitAll(); }
 });
 
 // Import file handling
@@ -726,7 +911,7 @@ window.addEventListener('resize', resize);
 
 resize();
 initInteractor();
-levels.push({ json: engine.toJSON(), containerRef: null, instanceId: null, dirty: false });
+levels.push({ json: engine.toJSON(), viewState: { x: 0, y: 0, zoom: 1 }, containerRef: null, instanceId: null, dirty: false });
 updateToolbar();
 updateModeBtn();
 renderLibrary();

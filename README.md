@@ -84,27 +84,29 @@ js/
   storage.js          IndexedDB helper (currently not wired into the UI)
 ```
 
-## Versioning / cache rule (for contributors)
+## Build / cache rule (for contributors)
 
-Every JS import carries a `?v=B<n>` suffix (plus the entry script tag in
-`index.html`), and `seed()` logs `[nandmorphic] BUILD B<n>` to the console.
-Static hosts may cache ES modules aggressively, so **any change to `js/`
-must bump the suffix on all imports and the BUILD tag together**. The dev
-server strips the query string when resolving files, so the suffixes are
-harmless locally.
+Run `node build.mjs` to produce `dist/` with content-hashed JS filenames
+(e.g. `js/main.4f82c91.js`). Imports inside each file are rewritten to
+match. `index.html` references the hashed entry point. Serve `dist/`
+with `node server.mjs` (now rooted at `dist/`). Any content change
+produces a different hash, auto-busting browser cache.
 
 ## Smoke checklist (before publishing)
 
-1. Page loads with zero console errors; console shows the current `BUILD` tag.
+1. Run `node build.mjs` — `dist/` is produced with hashed JS filenames.
+2. Start server: `node server.mjs` (serves `dist/`).
+3. Page loads with zero console errors; browser Network tab shows all
+   JS files with content-hash names (e.g. `main.4f82c91.js`).
 2. Seed circuit reads `NAND(A=0,B=1)=1` — output node bright, its wire green.
 3. Switch to Run mode: `clk` counter advances on its own.
 4. Click an input: its wire changes state and the output node flips.
 5. `Space` and the Clock button both advance `clk`.
 6. Encapsulate the seed NAND into a custom node, insert an instance from the
    Library, and confirm its output follows input toggles (custom live eval).
-7. Double-click the instance: reorder input/output ports with `▲`/`▼`, press
-   OK, and confirm wires followed the moved ports and values still evaluate.
-8. Reorder definitions in the Library with `▲`/`▼`.
+7. Double-click the instance: reorder input/output ports with drag handle ⠿,
+    press OK, and confirm wires followed the moved ports and values still evaluate.
+8. Reorder definitions in the Library with the drag handle ⠿.
 9. Drill into the custom node, edit it, and confirm the tab shows `●`; close
    it and walk through Save and Close / Close without Saving / Return to Edit.
 

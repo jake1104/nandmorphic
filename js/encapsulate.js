@@ -12,7 +12,7 @@
 // Port names inherit the INPUT/OUTPUT node's own port name (inputNames[0] /
 // outputNames[0]) or node name.
 
-import { NodeKind } from './model.js?v=B4';
+import { NodeKind } from './model.js';
 
 export function buildDefinitionFromCircuit(engine, selectedIds) {
   const selected = new Set(selectedIds);
@@ -35,6 +35,8 @@ export function buildDefinitionFromCircuit(engine, selectedIds) {
       ref: n.ref || null,
       name: n.name || '',
       value: n.value | 0,
+      x: n.x,
+      y: n.y,
     };
     if (n.kind === NodeKind.INPUT) {
       copy.inputIndex = inputNames.length;

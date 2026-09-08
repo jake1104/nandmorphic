@@ -9,9 +9,14 @@
 //   - click empty space + drag = marquee selection
 //   - Delete key removes selected nodes
 
-import { NodeKind } from './model.js?v=B4';
-import { nodeAt, outputPortAt, inputPortAt, NODE_HIT_R, nodeBox } from './renderer.js?v=B4';
-import { inputPortPos, outputPortPos, inputPortCount as inCount, outputPortCount as outCount } from './ports.js?v=B4';
+import { NodeKind } from './model.js';
+import { nodeAt, outputPortAt, inputPortAt, NODE_HIT_R, nodeBox } from './renderer.js';
+import { inputPortPos, outputPortPos, inputPortCount as inCount, outputPortCount as outCount } from './ports.js';
+
+function cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
 
 export class Interactor {
   constructor(engine, canvas, view, hooks) {
@@ -20,7 +25,7 @@ export class Interactor {
     this.view = view;
     this.hooks = hooks || {};
     this.selection = new Set();
-    this.mode = null; // null | 'drag' | 'wire' | 'marquee'
+    this.mode = null; // null | 'drag' | 'wire' | 'marquee' | 'pan'
     this.dragNode = null;
     this.dragMoved = false;
     this.dragStart = null;
@@ -30,14 +35,21 @@ export class Interactor {
     this.marquee = null;
     this.hover = null; // hovered node id (body)
     this.hoverPort = null; // { node, dir:'in'|'out', port }
+    this.panStart = null; // { sx, sy, vx, vy } for middle-click pan
+  }
+
+  screenToWorld(sx, sy) {
+    return {
+      x: sx / this.view.zoom + this.view.x,
+      y: sy / this.view.zoom + this.view.y,
+    };
   }
 
   toWorld(e) {
     const rect = this.canvas.getBoundingClientRect();
-    return {
-      x: (e.clientX - rect.left) + this.view.x,
-      y: (e.clientY - rect.top) + this.view.y,
-    };
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+    return this.screenToWorld(sx, sy);
   }
 
   onPointerDown(e) {
@@ -45,6 +57,14 @@ export class Interactor {
     const nodes = this.engine.getNodes();
     const values = this.engine.evaluate();
     const node = nodeAt(nodes, values, p.x, p.y);
+
+    // middle-click: start panning
+    if (e.button === 1) {
+      e.preventDefault();
+      this.mode = 'pan';
+      this.panStart = { sx: e.clientX, sy: e.clientY, vx: this.view.x, vy: this.view.y };
+      return;
+    }
 
     // Port circles straddle the body edge: their outer half sits beyond the
     // body rect, so a body hit is not guaranteed. Find a port hit anywhere
@@ -64,6 +84,12 @@ export class Interactor {
         this.engine.toggleInput(node.id);
         if (this.hooks.onStatus) this.hooks.onStatus('toggled input');
         this.engine.bump();
+      }
+      // middle-click pans even in run mode
+      if (e.button === 1) {
+        e.preventDefault();
+        this.mode = 'pan';
+        this.panStart = { sx: e.clientX, sy: e.clientY, vx: this.view.x, vy: this.view.y };
       }
       return;
     }
@@ -118,6 +144,15 @@ export class Interactor {
   onPointerMove(e) {
     const p = this.toWorld(e);
     const nodes = this.engine.getNodes();
+
+    if (this.mode === 'pan' && this.panStart) {
+      const dx = e.clientX - this.panStart.sx;
+      const dy = e.clientY - this.panStart.sy;
+      this.view.x = this.panStart.vx - dx / this.view.zoom;
+      this.view.y = this.panStart.vy - dy / this.view.zoom;
+      this.canvas.style.cursor = 'grabbing';
+      return;
+    }
 
     if (this.mode === 'wire') {
       this.wireCursor = p;
@@ -194,6 +229,7 @@ export class Interactor {
     this.wire = null;
     this.wireCursor = null;
     this.snapTarget = null;
+    this.panStart = null;
     this.engine.bump();
   }
 
@@ -280,8 +316,11 @@ export class Interactor {
   }
 
   drawOverlay(ctx, view) {
+    const dpr = window.devicePixelRatio || 1;
     ctx.save();
-    ctx.translate(-view.x, -view.y);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.translate(-view.x * view.zoom, -view.y * view.zoom);
+    ctx.scale(view.zoom, view.zoom);
 
     if (this.marquee) {
       const x = Math.min(this.marquee.x0, this.marquee.x1);
@@ -307,7 +346,7 @@ export class Interactor {
 
       const backward = s.x >= d.x - 8;
       ctx.beginPath();
-      ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+      ctx.strokeStyle = cssVar('--tether', 'rgba(255,255,255,0.75)');
       ctx.lineWidth = 2;
       ctx.setLineDash([5, 4]);
       ctx.moveTo(s.x, s.y);
@@ -315,12 +354,17 @@ export class Interactor {
         const mx = (s.x + d.x) / 2;
         ctx.bezierCurveTo(mx, s.y, mx, d.y, d.x, d.y);
       } else {
-        const rise = 48 + Math.min(90, Math.abs(s.x - d.x) * 0.22 + Math.abs(s.y - d.y) * 0.12);
-        const top = Math.min(s.y, d.y) - rise;
+        const dx = Math.abs(s.x - d.x);
+        const dy = Math.abs(s.y - d.y);
+        const rise = 48 + Math.min(90, dx * 0.22 + dy * 0.12);
+        const srcNodeY = this.wire.srcNode ? this.wire.srcNode.y : s.y;
+        const dstNodeY = this.snapTarget ? this.snapTarget.node.y : d.y;
+        const srcBelowDst = srcNodeY > dstNodeY;
+        const bendY = srcBelowDst ? Math.max(s.y, d.y) + rise : Math.min(s.y, d.y) - rise;
         const midX = (s.x + d.x) / 2;
         const c1x = s.x + 22, c2x = d.x - 22;
-        ctx.bezierCurveTo(c1x, s.y, c1x, top, midX, top);
-        ctx.bezierCurveTo(c2x, top, c2x, d.y, d.x, d.y);
+        ctx.bezierCurveTo(c1x, s.y, c1x, bendY, midX, bendY);
+        ctx.bezierCurveTo(c2x, bendY, c2x, d.y, d.x, d.y);
       }
       ctx.stroke();
       ctx.setLineDash([]);

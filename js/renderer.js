@@ -5,11 +5,11 @@
 // the longest label/port-name. Each input port shows (if set) its name on the
 // left; each output port shows (if set) its name + live value.
 
-import { NodeKind, defaultLabel } from './model.js?v=B4';
+import { NodeKind, defaultLabel } from './model.js';
 import {
   NODE_R, PORT_R, inputPortPos, outputPortPos,
   inputPortCount, outputPortCount, nodeSize,
-} from './ports.js?v=B4';
+} from './ports.js';
 
 const COLORS = {
   [NodeKind.NAND]: '#ff7b72',
@@ -17,6 +17,18 @@ const COLORS = {
   [NodeKind.OUTPUT]: '#c3e88d',
   [NodeKind.CUSTOM]: '#d2a8ff',
 };
+
+const KIND_VARS = {
+  [NodeKind.NAND]: '--nand',
+  [NodeKind.INPUT]: '--input',
+  [NodeKind.OUTPUT]: '--output',
+  [NodeKind.CUSTOM]: '--custom',
+};
+
+function cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
 
 const FONT = '600 11px "Segoe UI", sans-serif';
 
@@ -45,11 +57,14 @@ export function nodeBox(node, values) {
 }
 
 export function draw(ctx, engine, view, selection, hover) {
+  const dpr = window.devicePixelRatio || 1;
   const w = ctx.canvas.width;
   const h = ctx.canvas.height;
   ctx.clearRect(0, 0, w, h);
   ctx.save();
-  ctx.translate(-view.x, -view.y);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.translate(-view.x * view.zoom, -view.y * view.zoom);
+  ctx.scale(view.zoom, view.zoom);
 
   const nodes = engine.getNodes();
   const values = engine.evaluate();
@@ -89,9 +104,9 @@ function outletValue(node, values, srcPort = 0) {
 function drawWire(ctx, src, srcPort, dst, port, active, values) {
   const s = outputPortPos(src, srcPort, nodeBox(src, values).w / 2);
   const d = inputPortPos(dst, port, nodeBox(dst, values).w / 2);
-  const backward = s.x >= d.x - 8; // feedback / wrap-around: route over the top
+  const backward = s.x >= d.x - 8;
   ctx.beginPath();
-  ctx.strokeStyle = active ? 'rgba(126,231,135,0.9)' : 'rgba(139,148,158,0.45)';
+  ctx.strokeStyle = active ? 'rgba(126,231,135,0.9)' : cssVar('--wire-dim', 'rgba(139,148,158,0.45)');
   ctx.lineWidth = backward ? 2.0 : 2.2;
   if (backward) ctx.setLineDash([]);
   ctx.moveTo(s.x, s.y);
@@ -102,30 +117,32 @@ function drawWire(ctx, src, srcPort, dst, port, active, values) {
     const dx = Math.abs(s.x - d.x);
     const dy = Math.abs(s.y - d.y);
     const rise = 48 + Math.min(90, dx * 0.22 + dy * 0.12);
-    const top = Math.min(s.y, d.y) - rise;
+    const srcBelowDst = src.y > dst.y;
+    const bendY = srcBelowDst ? Math.max(s.y, d.y) + rise : Math.min(s.y, d.y) - rise;
     const midX = (s.x + d.x) / 2;
-    // two-segment arch: s up -> top -> d down (smooth via two beziers)
     const c1x = s.x + 22;
     const c2x = d.x - 22;
-    // first leg to midpoint top
-    ctx.bezierCurveTo(c1x, s.y, c1x, top, midX, top);
-    ctx.bezierCurveTo(c2x, top, c2x, d.y, d.x, d.y);
+    ctx.bezierCurveTo(c1x, s.y, c1x, bendY, midX, bendY);
+    ctx.bezierCurveTo(c2x, bendY, c2x, d.y, d.x, d.y);
   }
   ctx.stroke();
   ctx.setLineDash([]);
-  // tiny dot at feedback bend for readability
   if (backward) {
-    const top = Math.min(s.y, d.y) - (48 + Math.min(90, Math.abs(s.x - d.x) * 0.22 + Math.abs(s.y - d.y) * 0.12));
+    const dx = Math.abs(s.x - d.x);
+    const dy = Math.abs(s.y - d.y);
+    const rise = 48 + Math.min(90, dx * 0.22 + dy * 0.12);
+    const srcBelowDst = src.y > dst.y;
+    const bendY = srcBelowDst ? Math.max(s.y, d.y) + rise : Math.min(s.y, d.y) - rise;
     const midX = (s.x + d.x) / 2;
     ctx.beginPath();
-    ctx.fillStyle = active ? 'rgba(126,231,135,0.9)' : 'rgba(139,148,158,0.35)';
-    ctx.arc(midX, top, 2.2, 0, Math.PI * 2);
+    ctx.fillStyle = active ? 'rgba(126,231,135,0.9)' : cssVar('--wire-dim', 'rgba(139,148,158,0.35)');
+    ctx.arc(midX, bendY, 2.2, 0, Math.PI * 2);
     ctx.fill();
   }
 }
 
 function drawNode(ctx, node, values, selected, hover) {
-  const color = COLORS[node.kind] || '#8b949e';
+  const color = cssVar(KIND_VARS[node.kind], COLORS[node.kind]) || cssVar('--node', '#8b949e');
   const { w, h } = nodeBox(node, values);
   const hw = w / 2, hh = h / 2;
 
@@ -138,7 +155,7 @@ function drawNode(ctx, node, values, selected, hover) {
   ctx.fillStyle = bodyColor.fill;
   ctx.fill();
   ctx.lineWidth = selected ? 3 : 2;
-  ctx.strokeStyle = selected ? '#58a6ff' : hover ? '#fff' : bodyColor.stroke;
+  ctx.strokeStyle = selected ? '#58a6ff' : hover ? cssVar('--hover-stroke', '#fff') : bodyColor.stroke;
   ctx.stroke();
 
   // center label (node name / kind / live value for OUTPUT/INPUT)
@@ -156,7 +173,7 @@ function drawNode(ctx, node, values, selected, hover) {
     if (nm) {
       ctx.textAlign = 'right';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = '#c9d1d9';
+      ctx.fillStyle = cssVar('--text-dim', '#c9d1d9');
       ctx.fillText(nm, pos.x - 8, pos.y);
     }
     drawPort(ctx, pos.x, pos.y, true);
@@ -167,7 +184,7 @@ function drawNode(ctx, node, values, selected, hover) {
     if (nm) {
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = '#c9d1d9';
+      ctx.fillStyle = cssVar('--text-dim', '#c9d1d9');
       ctx.fillText(nm, pos.x + 8, pos.y);
     }
     drawPort(ctx, pos.x, pos.y, false);
@@ -220,12 +237,13 @@ function roundRectPath(ctx, x, y, w, h, r) {
 }
 
 function drawPort(ctx, x, y, isInput = false) {
+  const fill = cssVar('--port-fill', '#e6edf3');
   ctx.beginPath();
   ctx.arc(x, y, PORT_R, 0, Math.PI * 2);
-  ctx.fillStyle = '#e6edf3';
+  ctx.fillStyle = fill;
   ctx.fill();
   ctx.lineWidth = 1.5;
-  ctx.strokeStyle = isInput ? '#8b949e' : '#e6edf3';
+  ctx.strokeStyle = isInput ? cssVar('--port-stroke', '#8b949e') : fill;
   ctx.stroke();
 }
 
