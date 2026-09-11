@@ -4,6 +4,8 @@ A NAND-only logic circuit playground in the browser. Build circuits from NAND
 gates and I/O nodes, simulate them live, and abstract any finished circuit
 into a reusable **custom node**.
 
+**Try it live:** https://jake1104.github.io/nandmorphic/
+
 Pure HTML / CSS / JavaScript + Canvas. No frameworks, no build step.
 
 ## Run
