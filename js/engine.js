@@ -53,6 +53,7 @@ export class Engine {
     }
     if (opts.outputCount !== undefined) outputCount = opts.outputCount;
     else if (kind === NodeKind.INPUT) outputCount = 1;
+    else if (kind === NodeKind.CONST) outputCount = 1;
     else if (kind === NodeKind.NAND) outputCount = 1;
     else if (kind === NodeKind.CUSTOM) {
       const d = this.definitions.get(opts.ref);
@@ -68,9 +69,15 @@ export class Engine {
       outputNames: ensureNames(opts.outputNames, outputCount),
       outputs: kind === NodeKind.CUSTOM ? new Array(outputCount).fill(0) : undefined,
       ref: opts.ref || null,
+      // displayName for primitives; for CUSTOM this is a per-instance
+      // fallback only — shared name lives on the definition (see nameOf()).
       name: opts.name || '',
+      // per-instance memo + color (all kinds, including CUSTOM)
+      memo: typeof opts.memo === 'string' ? opts.memo.slice(0, 500) : '',
+      color: typeof opts.color === 'string' ? opts.color.slice(0, 32) : '',
     };
     this.nodes.set(id, node);
+    if (kind === NodeKind.CUSTOM && opts.ref) this.syncCustomInstances(opts.ref);
     this.bump();
     return node;
   }
@@ -89,8 +96,8 @@ export class Engine {
     const dst = this.nodes.get(dstId);
     if (!src || !dst) return false;
     if (srcId === dstId) return false;
-    if (src.outputCount <= srcPort) return false;
-    if (!dst.inputs || portIndex < 0 || portIndex >= dst.inputCount) return false;
+    if (this.outputCountOf(src) <= srcPort) return false;
+    if (!dst.inputs || portIndex < 0 || portIndex >= this.inputCountOf(dst)) return false;
     dst.inputs[portIndex] = srcId;
     dst.sourcePorts[portIndex] = srcPort;
     this.bump();
@@ -113,9 +120,126 @@ export class Engine {
       this.bump();
     }
   }
+  // CONST toggles only in dev(edit) mode; locked in run mode.
+  toggleConst(id) {
+    const n = this.nodes.get(id);
+    if (!n || n.kind !== NodeKind.CONST) return false;
+    if (this.mode !== Mode.DEV) return false;
+    n.value = n.value ? 0 : 1;
+    this._values.set(id, n.value | 0);
+    this.bump();
+    return true;
+  }
+  setNodeMemo(nodeId, memo) {
+    const n = this.nodes.get(nodeId);
+    if (!n) return;
+    n.memo = String(memo || '').slice(0, 500);
+    this.bump();
+  }
+  setNodeColor(nodeId, color) {
+    const n = this.nodes.get(nodeId);
+    if (!n) return;
+    n.color = String(color || '').slice(0, 32);
+    this.bump();
+  }
+  // ---- Shared CUSTOM info: single source of truth = definitions ----
+  customDefOf(node) {
+    if (!node || node.kind !== NodeKind.CUSTOM) return null;
+    return this.definitions.get(node.ref) || null;
+  }
+  inputCountOf(node) {
+    if (!node) return 0;
+    if (node.kind === NodeKind.CUSTOM) {
+      const d = this.definitions.get(node.ref);
+      return d ? d.inputs : 0;
+    }
+    return node.inputCount | 0;
+  }
+  outputCountOf(node) {
+    if (!node) return 0;
+    if (node.kind === NodeKind.CUSTOM) {
+      const d = this.definitions.get(node.ref);
+      return d ? d.outputs : 0;
+    }
+    return node.outputCount | 0;
+  }
+  nameOf(node) {
+    if (!node) return '';
+    if (node.kind === NodeKind.CUSTOM) {
+      const d = this.definitions.get(node.ref);
+      if (d) return d.name || node.name || '';
+    }
+    return node.name || '';
+  }
+  inputNameOf(node, i) {
+    if (!node) return '';
+    if (node.kind === NodeKind.CUSTOM) {
+      const d = this.definitions.get(node.ref);
+      const list = (d && d.circuit && d.circuit.ports && d.circuit.ports.inputs) || [];
+      return list[i] || '';
+    }
+    return (node.inputNames && node.inputNames[i]) || '';
+  }
+  outputNameOf(node, i) {
+    if (!node) return '';
+    if (node.kind === NodeKind.CUSTOM) {
+      const d = this.definitions.get(node.ref);
+      const list = (d && d.circuit && d.circuit.ports && d.circuit.ports.outputs) || [];
+      return list[i] || '';
+    }
+    return (node.outputNames && node.outputNames[i]) || '';
+  }
+  // Mirror shared definition state into each instance's cached fields so
+  // geometry (ports.js) and old serialized data keep working. Cached fields
+  // are never edited directly for CUSTOM — use setShared* below.
+  syncCustomInstances(defId) {
+    const def = this.definitions.get(defId);
+    if (!def) return;
+    const inNames = ((def.circuit && def.circuit.ports && def.circuit.ports.inputs) || []).slice();
+    const outNames = ((def.circuit && def.circuit.ports && def.circuit.ports.outputs) || []).slice();
+    this.nodes.forEach((n) => {
+      if (n.kind !== NodeKind.CUSTOM || n.ref !== defId) return;
+      n.inputCount = def.inputs;
+      n.outputCount = def.outputs;
+      n.name = def.name || '';
+      n.inputNames = ensureNames(inNames, def.inputs);
+      n.outputNames = ensureNames(outNames, def.outputs);
+      const oldIn = n.inputs || [];
+      const oldSp = n.sourcePorts || [];
+      n.inputs = new Array(def.inputs).fill(null);
+      n.sourcePorts = new Array(def.inputs).fill(0);
+      for (let i = 0; i < Math.min(oldIn.length, def.inputs); i++) {
+        n.inputs[i] = oldIn[i];
+        n.sourcePorts[i] = oldSp[i] | 0;
+      }
+      n.outputs = new Array(def.outputs).fill(0);
+    });
+  }
+  setSharedName(defId, name) {
+    const def = this.definitions.get(defId);
+    if (!def) return false;
+    def.name = String(name || '').slice(0, 24);
+    this.syncCustomInstances(defId);
+    this.bump();
+    return true;
+  }
+  setSharedPortName(defId, dir, port, name) {
+    const def = this.definitions.get(defId);
+    if (!def || !def.circuit || !def.circuit.ports) return false;
+    const list = dir === 'in' ? def.circuit.ports.inputs : def.circuit.ports.outputs;
+    if (!list || port < 0 || port >= list.length) return false;
+    list[port] = String(name || '').slice(0, 16);
+    this.syncCustomInstances(defId);
+    this.bump();
+    return true;
+  }
   setPortName(nodeId, dir, port, name) {
     const n = this.nodes.get(nodeId);
     if (!n) return;
+    if (n.kind === NodeKind.CUSTOM) {
+      this.setSharedPortName(n.ref, dir, port, name);
+      return;
+    }
     const arr = dir === 'in' ? n.inputNames : n.outputNames;
     if (port < 0 || port >= arr.length) return;
     arr[port] = String(name || '').slice(0, 16);
@@ -124,6 +248,10 @@ export class Engine {
   setNodeName(nodeId, name) {
     const n = this.nodes.get(nodeId);
     if (!n) return;
+    if (n.kind === NodeKind.CUSTOM) {
+      this.setSharedName(n.ref, name);
+      return;
+    }
     n.name = String(name || '').slice(0, 24);
     this.bump();
   }
@@ -134,6 +262,64 @@ export class Engine {
   swapNodePorts(nodeId, dir, i, j) {
     const n = this.nodes.get(nodeId);
     if (!n || i === j) return false;
+    // CUSTOM ports are shared: reorder the definition once, then remap
+    // every instance of the same kind so all stay in sync.
+    if (n.kind === NodeKind.CUSTOM) {
+      const def = this.definitions.get(n.ref);
+      if (!def || !def.circuit || !def.circuit.ports) return false;
+      if (dir === 'in') {
+        const names = def.circuit.ports.inputs;
+        if (i < 0 || j < 0 || i >= names.length || j >= names.length) return false;
+        [names[i], names[j]] = [names[j], names[i]];
+        // remap circuit-internal port order markers
+        (def.circuit.nodes || []).forEach((cn) => {
+          if (cn.kind === 'output') {
+            if (cn.outputIndex === i) cn.outputIndex = j;
+            else if (cn.outputIndex === j) cn.outputIndex = i;
+          }
+        });
+        this.nodes.forEach((m) => {
+          if (m.kind === NodeKind.CUSTOM && m.ref === n.ref && m.inputs) {
+            [m.inputs[i], m.inputs[j]] = [m.inputs[j], m.inputs[i]];
+            [m.sourcePorts[i], m.sourcePorts[j]] = [m.sourcePorts[j], m.sourcePorts[i]];
+          }
+        });
+        this.syncCustomInstances(n.ref);
+        this.bump();
+        return true;
+      }
+      const names = def.circuit.ports.outputs;
+      if (i < 0 || j < 0 || i >= names.length || j >= names.length) return false;
+      [names[i], names[j]] = [names[j], names[i]];
+      (def.circuit.nodes || []).forEach((cn) => {
+        if (cn.kind === 'output') {
+          if (cn.outputIndex === i) cn.outputIndex = j;
+          else if (cn.outputIndex === j) cn.outputIndex = i;
+        }
+      });
+      this.nodes.forEach((m) => {
+        if (!m.inputs) return;
+        for (let k = 0; k < m.inputs.length; k++) {
+          if (m.inputs[k] && this.nodes.get(m.inputs[k])?.kind === NodeKind.CUSTOM && this.nodes.get(m.inputs[k]).ref === n.ref) {
+            if (m.sourcePorts[k] === i) m.sourcePorts[k] = j;
+            else if (m.sourcePorts[k] === j) m.sourcePorts[k] = i;
+          }
+        }
+      });
+      // remap stored definition edges' srcPort for this kind
+      this.definitions.forEach((d) => {
+        (d.circuit.edges || []).forEach((e) => {
+          const src = (d.circuit.nodes || []).find((cn) => cn.id === e.from);
+          if (src && src.kind === 'custom' && src.ref === n.ref) {
+            if (e.srcPort === i) e.srcPort = j;
+            else if (e.srcPort === j) e.srcPort = i;
+          }
+        });
+      });
+      this.syncCustomInstances(n.ref);
+      this.bump();
+      return true;
+    }
     if (dir === 'in') {
       if (!n.inputs || i < 0 || j < 0 || i >= n.inputs.length || j >= n.inputs.length) return false;
       [n.inputNames[i], n.inputNames[j]] = [n.inputNames[j], n.inputNames[i]];
@@ -309,6 +495,7 @@ export class Engine {
   evalNode(node, values) {
     switch (node.kind) {
       case NodeKind.INPUT:
+      case NodeKind.CONST:
         return node.value | 0;
       case NodeKind.OUTPUT: {
         return this.readInputBit(node, 0, values);
@@ -360,9 +547,9 @@ export class Engine {
 
   // Full evaluation: sequential (on clock edge) -> combinational propagation
   evaluate() {
-    // Initialize values from INPUT nodes
+    // Initialize values from INPUT/CONST nodes
     for (const node of this.getNodes()) {
-      if (node.kind === NodeKind.INPUT) {
+      if (node.kind === NodeKind.INPUT || node.kind === NodeKind.CONST) {
         this._values.set(node.id, node.value | 0);
       }
     }
@@ -405,14 +592,14 @@ export class Engine {
   // definition are resolved recursively with source ports honored.
   evaluateCustomLive(instance, values) {
     const def = this.definitions.get(instance.ref);
-    if (!def) return new Array(instance.outputCount).fill(0);
+    if (!def) return new Array(this.outputCountOf(instance)).fill(0);
     const inputValues = [];
-    for (let p = 0; p < instance.inputCount; p++) {
+    for (let p = 0; p < this.inputCountOf(instance); p++) {
       inputValues.push(this.readInputBit(instance, p, values));
     }
     const bits = this.simulateDefinition(def, inputValues);
     // Pad to the instance's output count in case the def was deduped.
-    const expected = instance.outputCount || bits.length;
+    const expected = this.outputCountOf(instance) || bits.length;
     while (bits.length < expected) bits.push(0);
     // Keep the renderer's snapshot fresh.
     instance.outputs = bits.slice();
@@ -450,6 +637,7 @@ export class Engine {
     def.inputs = signature.inputCount;
     def.outputs = signature.outputCount;
     def.ticks = computeTicksForCircuit(circuit, this.definitions);
+    this.syncCustomInstances(defId);
     this.bump();
     return def;
   }
@@ -489,12 +677,13 @@ export class Engine {
     for (const cn of circuit.nodes) {
       const laid = pos.get(cn.id) || { x: 160 + Math.random() * 40, y: 160 + Math.random() * 40 };
       const p = (Number.isFinite(cn.x) && Number.isFinite(cn.y)) ? { x: cn.x, y: cn.y } : laid;
-      if (cn.kind === 'input') this.addNode(NodeKind.INPUT, p.x, p.y, { id: cn.id, value: cn.value | 0, name: cn.name || '' });
-      else if (cn.kind === 'output') this.addNode(NodeKind.OUTPUT, p.x, p.y, { id: cn.id, name: cn.name || '' });
-      else if (cn.kind === 'nand') this.addNode(NodeKind.NAND, p.x, p.y, { id: cn.id, name: cn.name || '' });
+      if (cn.kind === 'input') this.addNode(NodeKind.INPUT, p.x, p.y, { id: cn.id, value: cn.value | 0, name: cn.name || '', memo: cn.memo || '', color: cn.color || '' });
+      else if (cn.kind === 'const') this.addNode(NodeKind.CONST, p.x, p.y, { id: cn.id, value: cn.value | 0, name: cn.name || '', memo: cn.memo || '', color: cn.color || '' });
+      else if (cn.kind === 'output') this.addNode(NodeKind.OUTPUT, p.x, p.y, { id: cn.id, name: cn.name || '', memo: cn.memo || '', color: cn.color || '' });
+      else if (cn.kind === 'nand') this.addNode(NodeKind.NAND, p.x, p.y, { id: cn.id, name: cn.name || '', memo: cn.memo || '', color: cn.color || '' });
       else if (cn.kind === 'custom') {
         if (!this.definitions.get(cn.ref)) continue;
-        this.addNode(NodeKind.CUSTOM, p.x, p.y, { id: cn.id, ref: cn.ref, name: cn.name || '' });
+        this.addNode(NodeKind.CUSTOM, p.x, p.y, { id: cn.id, ref: cn.ref, memo: cn.memo || '', color: cn.color || '' });
       }
     }
     for (const e of circuit.edges) {
@@ -508,15 +697,9 @@ export class Engine {
   repointInstance(instanceId, def) {
     const n = this.nodes.get(instanceId);
     if (!n || n.kind !== NodeKind.CUSTOM) return;
-    n.ref = def.id; n.name = def.name;
-    const oldIn = n.inputs, oldSp = n.sourcePorts;
-    n.inputCount = def.inputs; n.outputCount = def.outputs;
-    n.inputs = new Array(def.inputs).fill(null);
-    n.sourcePorts = new Array(def.inputs).fill(0);
-    for (let i = 0; i < def.inputs; i++) if (oldIn && oldIn[i]) { n.inputs[i] = oldIn[i]; n.sourcePorts[i] = oldSp ? (oldSp[i] | 0) : 0; }
-    n.inputNames = portNamesOfDef(def, 'in');
-    n.outputNames = portNamesOfDef(def, 'out');
-    n.outputs = new Array(def.outputs).fill(0);
+    n.ref = def.id;
+    this.syncCustomInstances(def.id);
+    // preserve per-instance wiring as far as possible (sync already truncates)
     this.bump();
   }
   repointAllInstances(defId, newDef) {
@@ -560,12 +743,12 @@ export class Engine {
 
   toJSON() {
     return {
-      version: 4,
+      version: 5,
       mode: this.mode,
       clock: this.clock,
       definitions: Array.from(this.definitions.values()),
       nodes: Array.from(this.nodes.values()).map((n) => ({
-        id: n.id, kind: n.kind, x: n.x, y: n.y, value: n.value, inputs: n.inputs || [], inputCount: n.inputCount, outputCount: n.outputCount, sourcePorts: n.sourcePorts || [], inputNames: n.inputNames || [], outputNames: n.outputNames || [], ref: n.ref, name: n.name,
+        id: n.id, kind: n.kind, x: n.x, y: n.y, value: n.value, inputs: n.inputs || [], inputCount: n.inputCount, outputCount: n.outputCount, sourcePorts: n.sourcePorts || [], inputNames: n.inputNames || [], outputNames: n.outputNames || [], ref: n.ref, name: n.name, memo: n.memo || '', color: n.color || '',
       })),
     };
   }
@@ -596,19 +779,27 @@ export class Engine {
       }
       if (outputCount === undefined) {
         if (n.kind === NodeKind.INPUT) outputCount = 1;
+        else if (n.kind === NodeKind.CONST) outputCount = 1;
         else if (n.kind === NodeKind.NAND) outputCount = 1;
         else if (n.kind === NodeKind.CUSTOM) outputCount = def ? def.outputs : 0;
         else outputCount = 0;
+      }
+      // CUSTOM shared info wins over stored copies (old files may diverge).
+      if (n.kind === NodeKind.CUSTOM && def) {
+        inputCount = def.inputs;
+        outputCount = def.outputs;
       }
       this.nodes.set(n.id, {
         id: n.id, kind: n.kind, x: n.x, y: n.y, value: n.value | 0,
         inputs: (n.inputs && n.inputs.length === inputCount) ? n.inputs : new Array(inputCount).fill(null),
         sourcePorts: (n.sourcePorts && n.sourcePorts.length === inputCount) ? n.sourcePorts : new Array(inputCount).fill(0),
         inputCount, outputCount,
-        inputNames: ensureNames(n.inputNames, inputCount),
-        outputNames: ensureNames(n.outputNames, outputCount),
+        inputNames: n.kind === NodeKind.CUSTOM && def ? portNamesOfDef(def, 'in') : ensureNames(n.inputNames, inputCount),
+        outputNames: n.kind === NodeKind.CUSTOM && def ? portNamesOfDef(def, 'out') : ensureNames(n.outputNames, outputCount),
         outputs: n.kind === NodeKind.CUSTOM ? new Array(outputCount).fill(0) : undefined,
-        ref: n.ref, name: n.name || '',
+        ref: n.ref, name: n.kind === NodeKind.CUSTOM && def ? (def.name || '') : (n.name || ''),
+        memo: typeof n.memo === 'string' ? n.memo.slice(0, 500) : '',
+        color: typeof n.color === 'string' ? n.color.slice(0, 32) : '',
       });
     });
     this.bump();
@@ -706,6 +897,7 @@ function simulateCircuit(def, engine, inputValues) {
     let r = 0;
     if (!n) { visiting.delete(id); return 0; }
     if (n.kind === 'input') r = value.get(id) | 0;
+    else if (n.kind === 'const') r = n.value | 0;
     else if (n.kind === 'nand') {
       const ins = (deps.get(id) || []).slice().sort((a, b) => a.port - b.port);
       const a = ins[0] !== undefined ? readFrom(ins[0].from, ins[0].srcPort) : 0;
@@ -742,6 +934,7 @@ function computeTicksForCircuit(circuit, definitions) {
     let d = 0;
     if (!n) d = 0;
     else if (n.kind === 'input') d = 0;
+    else if (n.kind === 'const') d = 0;
     else if (n.kind === 'nand') {
       const ds = (deps.get(id)||[]).map(s=>depth(s));
       d = 1 + (ds.length? Math.max(...ds):0);

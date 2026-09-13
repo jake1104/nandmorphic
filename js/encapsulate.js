@@ -25,7 +25,8 @@ export function buildDefinitionFromCircuit(engine, selectedIds) {
   const outputNames = [];  // parallel to output ports
 
   // 1. Copy selected nodes. Internal INPUT/OUTPUT nodes become the definition's
-  //    ports; their order is the port order.
+  //    ports; their order is the port order. CONST nodes stay inside as fixed
+  //    values (last edit-mode value) and never become ports.
   for (const n of nodes) {
     const copy = {
       id: n.id,
@@ -35,6 +36,8 @@ export function buildDefinitionFromCircuit(engine, selectedIds) {
       ref: n.ref || null,
       name: n.name || '',
       value: n.value | 0,
+      memo: n.memo || '',
+      color: n.color || '',
       x: n.x,
       y: n.y,
     };

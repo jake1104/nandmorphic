@@ -6,6 +6,7 @@ export const NodeKind = {
   OUTPUT: 'output',
   NAND: 'nand',
   CUSTOM: 'custom',
+  CONST: 'const',
 };
 
 // Default name used as a label fallback per node kind.
@@ -14,6 +15,7 @@ export function defaultLabel(node) {
     case NodeKind.INPUT: return 'IN';
     case NodeKind.OUTPUT: return 'OUT';
     case NodeKind.NAND: return 'NAND';
+    case NodeKind.CONST: return node.value ? '1' : '0';
     case NodeKind.CUSTOM: return node.name || 'CUSTOM';
     default: return '';
   }
@@ -46,6 +48,7 @@ export function evaluateValue(node, nodeMap, memo, visiting) {
   let result;
   switch (node.kind) {
     case NodeKind.INPUT:
+    case NodeKind.CONST:
     case NodeKind.PULSE:
       result = node.value ? 1 : 0;
       break;

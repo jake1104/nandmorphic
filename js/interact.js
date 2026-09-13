@@ -31,7 +31,8 @@ export class Interactor {
     this.dragStart = null;
     this.wire = null; // { srcNode, srcPort, live }, live = wire currently being pulled
     this.wireCursor = null; // { x, y }
-    this.snapTarget = null; // { node, port } under cursor while wiring
+    this.snapTarget = null; // { node, port } input drop candidate while wiring
+    this.snapSource = null; // { node, port } output candidate while re-routing
     this.marquee = null;
     this.hover = null; // hovered node id (body)
     this.hoverPort = null; // { node, dir:'in'|'out', port }
@@ -157,7 +158,11 @@ export class Interactor {
     if (this.mode === 'wire') {
       this.wireCursor = p;
       this.updateSnap(p);
-      this.hoverPort = this.snapTarget ? { node: this.snapTarget.node, dir: 'in', port: this.snapTarget.port } : null;
+      if (this.wire && this.wire.reroute) {
+        this.hoverPort = this.snapSource ? { node: this.snapSource.node, dir: 'out', port: this.snapSource.port } : null;
+      } else {
+        this.hoverPort = this.snapTarget ? { node: this.snapTarget.node, dir: 'in', port: this.snapTarget.port } : null;
+      }
       this.hover = null;
       return;
     }
@@ -210,7 +215,12 @@ export class Interactor {
     if (this.mode === 'wire') {
       this.finishWire(p);
     } else if (this.mode === 'drag' && this.dragNode && !this.dragMoved) {
-      // no-op on click in dev mode (INPUT toggling is run-mode only)
+      // dev(edit) mode: click a CONST body toggles its fixed value.
+      // (INPUT toggling stays run-mode only; CONST is locked in run mode.)
+      if (this.engine.mode !== 'run' && this.dragNode.kind === NodeKind.CONST) {
+        this.engine.toggleConst(this.dragNode.id);
+        if (this.hooks.onStatus) this.hooks.onStatus(`const = ${this.dragNode.value | 0}`);
+      }
     } else if (this.mode === 'marquee' && this.marquee) {
       const x0 = Math.min(this.marquee.x0, this.marquee.x1);
       const y0 = Math.min(this.marquee.y0, this.marquee.y1);
@@ -229,6 +239,7 @@ export class Interactor {
     this.wire = null;
     this.wireCursor = null;
     this.snapTarget = null;
+    this.snapSource = null;
     this.panStart = null;
     this.engine.bump();
   }
@@ -245,25 +256,43 @@ export class Interactor {
     }
   }
 
-  // During a pull, find the nearest input port to snap the tether to.
+  // During a pull, find the nearest port to snap the tether to.
+  // Fresh wire (output -> input): snap to the nearest INPUT port.
+  // Re-route (input's old wire): snap to the nearest OUTPUT port so the
+  // user can pick a new source. Port circles sit on the node edge, so both
+  // are matched by circle distance — including the outer half outside the body.
   updateSnap(p) {
     const nodes = this.engine.getNodes();
     const values = this.engine.evaluate();
-    let best = null;
-    let bestDist = Infinity;
+    const isReroute = !!(this.wire && this.wire.reroute);
+    let bestIn = null;
+    let bestInDist = Infinity;
+    let bestOut = null;
+    let bestOutDist = Infinity;
     for (const n of nodes) {
-      const count = inCount(n);
+      const inN = inCount(n);
       const hw = nodeBox(n, values).w / 2;
-      for (let port = 0; port < count; port++) {
+      for (let port = 0; port < inN; port++) {
         const pos = inputPortPos(n, port, hw);
         const dx = p.x - pos.x;
         const dy = p.y - pos.y;
         const d = dx * dx + dy * dy;
-        if (d < bestDist) { bestDist = d; best = { node: n, port, dist: d }; }
+        if (d < bestInDist) { bestInDist = d; bestIn = { node: n, port, dist: d }; }
+      }
+      const outN = outCount(n);
+      for (let port = 0; port < outN; port++) {
+        const pos = outputPortPos(n, port, hw);
+        const dx = p.x - pos.x;
+        const dy = p.y - pos.y;
+        const d = dx * dx + dy * dy;
+        if (isReroute && this.wire.reroute.dst && n.id === this.wire.reroute.dst.id) continue;
+        if (d < bestOutDist) { bestOutDist = d; bestOut = { node: n, port, dist: d }; }
       }
     }
-    if (best && bestDist < 26 * 26) this.snapTarget = { node: best.node, port: best.port };
+    if (bestIn && bestInDist < 26 * 26) this.snapTarget = { node: bestIn.node, port: bestIn.port };
     else this.snapTarget = null;
+    if (bestOut && bestOutDist < 26 * 26) this.snapSource = { node: bestOut.node, port: bestOut.port };
+    else this.snapSource = null;
   }
 
   finishWire(p) {
@@ -271,6 +300,7 @@ export class Interactor {
     if (!wire) return;
 
     // choose drop target: snapped port, else any port under cursor
+    // (circle hit works outside the body edge too).
     let target = this.snapTarget;
     if (!target) {
       const node = nodeAt(this.engine.getNodes(), this.engine.evaluate(), p.x, p.y);
@@ -279,11 +309,22 @@ export class Interactor {
         if (port >= 0) target = { node, port };
       }
     }
+    let source = this.snapSource;
+    if (!source) {
+      for (const n of this.engine.getNodes()) {
+        const port = outputPortAt(n, p.x, p.y, this.engine.evaluate());
+        if (port >= 0) {
+          if (wire.reroute && wire.reroute.dst && n.id === wire.reroute.dst.id) continue;
+          source = { node: n, port };
+          break;
+        }
+      }
+    }
 
     if (wire.reroute) {
-      // re-routing an existing connection
-      if (target && target.node !== wire.reroute.dst) {
-        this.engine.connect(target.node.id, wire.reroute.dst.id, wire.reroute.port, target.port);
+      // re-routing an existing connection: new source -> original input
+      if (source) {
+        this.engine.connect(source.node.id, wire.reroute.dst.id, wire.reroute.port, source.port);
       }
       // else: dropped into empty space -> connection stays removed (disconnect)
       return;
@@ -337,12 +378,22 @@ export class Interactor {
     // current pulled wire tether
     if (this.wire && this.wireCursor) {
       const values = this.engine.evaluate();
-      const s = this.wire.srcNode
-        ? outputPortPos(this.wire.srcNode, Math.max(this.wire.srcPort, 0), nodeBox(this.wire.srcNode, values).w / 2)
-        : this.wireCursor;
-      const d = this.snapTarget
-        ? inputPortPos(this.snapTarget.node, this.snapTarget.port, nodeBox(this.snapTarget.node, values).w / 2)
-        : this.wireCursor;
+      const isReroute = !!(this.wire && this.wire.reroute);
+      let s, d;
+      if (isReroute) {
+        const dst = this.wire.reroute.dst;
+        d = inputPortPos(dst, this.wire.reroute.port, nodeBox(dst, values).w / 2);
+        s = this.snapSource
+          ? outputPortPos(this.snapSource.node, this.snapSource.port, nodeBox(this.snapSource.node, values).w / 2)
+          : this.wireCursor;
+      } else {
+        s = this.wire.srcNode
+          ? outputPortPos(this.wire.srcNode, Math.max(this.wire.srcPort, 0), nodeBox(this.wire.srcNode, values).w / 2)
+          : this.wireCursor;
+        d = this.snapTarget
+          ? inputPortPos(this.snapTarget.node, this.snapTarget.port, nodeBox(this.snapTarget.node, values).w / 2)
+          : this.wireCursor;
+      }
 
       const backward = s.x >= d.x - 8;
       ctx.beginPath();
@@ -369,10 +420,13 @@ export class Interactor {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // highlight snap target port
-      if (this.snapTarget) {
-        const t = this.snapTarget;
-        const pos = inputPortPos(t.node, t.port, nodeBox(t.node, values).w / 2);
+      // highlight snap target port (input for fresh wire, output for re-route)
+      // Circles sit on the node edge: highlight by circle distance so the
+      // outer half outside the body still lights up.
+      const hl = (node, port, dir) => {
+        const pos = dir === 'in'
+          ? inputPortPos(node, port, nodeBox(node, values).w / 2)
+          : outputPortPos(node, port, nodeBox(node, values).w / 2);
         ctx.beginPath();
         ctx.arc(pos.x, pos.y, 8, 0, Math.PI * 2);
         ctx.fillStyle = 'rgba(126,231,135,0.35)';
@@ -380,6 +434,15 @@ export class Interactor {
         ctx.lineWidth = 2;
         ctx.strokeStyle = '#7ee787';
         ctx.stroke();
+      };
+      if (this.wire.reroute) {
+        if (this.snapSource) hl(this.snapSource.node, this.snapSource.port, 'out');
+      } else if (this.snapTarget) {
+        hl(this.snapTarget.node, this.snapTarget.port, 'in');
+      }
+      // while dragging, any output port under the cursor also lights up
+      if (this.hoverPort && this.hoverPort.dir === 'out') {
+        hl(this.hoverPort.node, this.hoverPort.port, 'out');
       }
     } else if (this.hoverPort && !this.mode) {
       // idle hover: highlight the port under the cursor

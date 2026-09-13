@@ -26,6 +26,8 @@ jobs:
           node-version: 22
       - name: Build single-file index.html
         run: node build-single.mjs
+        env:
+          BUILD_HASH: ${{ github.sha }}
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

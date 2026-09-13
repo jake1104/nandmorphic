@@ -6,6 +6,10 @@ import { Interactor } from './interact.js';
 import { NodeKind } from './model.js';
 import { buildDefinitionFromCircuit } from './encapsulate.js';
 
+// Baked in at build time (build.mjs / build-single.mjs replace __BUILD_ID__
+// with the git short hash; falls back to 'dev' when git is unavailable).
+const BUILD_ID = '__BUILD_ID__';
+
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
@@ -41,7 +45,7 @@ function render() {
   const dpr = window.devicePixelRatio || 1;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  draw(ctx, engine, view, interactor ? interactor.selection : new Set(), interactor ? interactor.hover : null);
+  draw(ctx, engine, view, interactor ? interactor.selection : new Set(), interactor ? interactor.hover : null, interactor ? interactor.hoverPort : null);
   if (interactor) interactor.drawOverlay(ctx, view);
 }
 
@@ -238,6 +242,8 @@ function commitLevel() {
   // Apply the (possibly deduped) result to ALL instances.
   // The parent level's instances are in its saved JSON, not in the current engine.
   // Update the parent level's JSON to point to the new definition.
+  // Shared CUSTOM: per-instance name/ports are derived from the definition,
+  // but keep cached copies in sync for old readers/geometry.
   if (f.containerRef && activeLevel > 0) {
     const parentLevel = levels[activeLevel - 1];
     if (parentLevel.json) {
@@ -256,9 +262,10 @@ function commitLevel() {
           n.name = newDef.name;
           n.inputCount = newDef.inputs;
           n.outputCount = newDef.outputs;
-          // Get port names from circuit.ports
+          // Get port names from circuit.ports (shared source of truth)
           n.inputNames = (newDef.circuit?.ports?.inputs || []).slice();
           n.outputNames = (newDef.circuit?.ports?.outputs || []).slice();
+          // memo/color are per-instance: leave untouched
         }
       });
       parentLevel.json = data;
@@ -371,17 +378,26 @@ function renderTabs() {
   });
 }
 
-// Inspector: edit a node's name and its input/output port names.
-// Port rows can be reordered with ↑/↓ (wiring follows the moved ports);
-// changes apply on OK, Cancel discards them.
+// Inspector: edit name / ports / memo / color.
+// CUSTOM name+ports are shared: editing one instance updates the definition
+// and every instance of the same kind. Memo+color stay per-instance.
 function inspectNode(node) {
   const n = engine.nodes.get(node.id) || node;
-  const inRows = (n.inputNames || []).map((nm, i) => ({
+  const isCustom = n.kind === NodeKind.CUSTOM;
+  const def = isCustom ? engine.definitions.get(n.ref) : null;
+  const sharedName = isCustom ? (def ? def.name : n.name) : n.name;
+  const inNames = isCustom
+    ? (((def && def.circuit && def.circuit.ports && def.circuit.ports.inputs) || []).slice())
+    : (n.inputNames || []).slice();
+  const outNames = isCustom
+    ? (((def && def.circuit && def.circuit.ports && def.circuit.ports.outputs) || []).slice())
+    : (n.outputNames || []).slice();
+  const inRows = inNames.map((nm, i) => ({
     name: nm || '', src: (n.inputs && n.inputs[i]) || null,
     sport: (n.sourcePorts && n.sourcePorts[i]) | 0, orig: i,
   }));
-  const outRows = (n.outputNames || []).map((nm, i) => ({ name: nm || '', orig: i }));
-  const isCustom = n.kind === NodeKind.CUSTOM;
+  const outRows = outNames.map((nm, i) => ({ name: nm || '', orig: i }));
+  const isConst = n.kind === NodeKind.CONST;
   const renderRows = () => {
     const host = document.getElementById('insp-ports');
     if (!host) return;
@@ -398,8 +414,14 @@ function inspectNode(node) {
   modalRoot.innerHTML = `
     <div class="modal">
       <h3>${escapeHtml(n.kind.toUpperCase())} — ${escapeHtml(n.id)}</h3>
+      ${isCustom ? '<p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">Shared kind: name + ports apply to every instance of this type.</p>' : ''}
+      ${isConst ? '<p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">CONST: click its body in dev mode to toggle 0/1. Locked in run mode. Becomes a fixed value inside custom nodes (no input port).</p>' : ''}
       <label>Name</label>
-      <input type="text" id="insp-name" value="${escapeHtml(n.name || '')}" />
+      <input type="text" id="insp-name" value="${escapeHtml(sharedName || '')}" />
+      <label>Memo (this node only)</label>
+      <input type="text" id="insp-memo" value="${escapeHtml(n.memo || '')}" placeholder="per-instance note" />
+      <label>Color (this node only, hex e.g. #e3b341)</label>
+      <input type="text" id="insp-color" value="${escapeHtml(n.color || '')}" placeholder="empty = kind default" />
       <div class="insp-ports" id="insp-ports"></div>
       <div class="actions">
         ${isCustom ? '<button class="btn" id="modal-open">Open Internals</button>' : ''}
@@ -424,6 +446,39 @@ function inspectNode(node) {
     const cur = engine.nodes.get(n.id);
     if (!cur) { closeModal(); return; }
     engine.setNodeName(n.id, document.getElementById('insp-name').value.trim());
+    engine.setNodeMemo(n.id, document.getElementById('insp-memo').value);
+    engine.setNodeColor(n.id, document.getElementById('insp-color').value.trim());
+    if (isCustom) {
+      // Shared kind: names go to the definition, wiring reorder applies to
+      // every instance of the same kind via engine.swapNodePorts().
+      inRows.forEach((r, i) => engine.setPortName(n.id, 'in', i, r.name));
+      outRows.forEach((r, i) => engine.setPortName(n.id, 'out', i, r.name));
+      // input wiring reorder for this instance only (connections differ)
+      if (cur.inputs && inRows.length === cur.inputs.length) {
+        // detect reorder by orig mapping
+        const orderChanged = inRows.some((r, idx) => r.orig !== idx);
+        if (orderChanged) {
+          const newInputs = inRows.map((r) => r.src);
+          const newSp = inRows.map((r) => r.sport | 0);
+          cur.inputs = newInputs;
+          cur.sourcePorts = newSp;
+        } else {
+          cur.inputs = inRows.map((r) => r.src);
+          cur.sourcePorts = inRows.map((r) => r.sport | 0);
+        }
+      }
+      // output reorder is global (shared): apply via sequential swaps
+      const curOrder = outRows.map((r) => r.orig);
+      for (let target = 0; target < curOrder.length; target++) {
+        const at = curOrder.indexOf(target);
+        if (at !== target) {
+          engine.swapNodePorts(n.id, 'out', at, target);
+          const tmp = curOrder[at];
+          curOrder[at] = curOrder[target];
+          curOrder[target] = tmp;
+        }
+      }
+    } else {
     // Apply reordered input ports (names + wiring follow the rows).
     if (cur.inputs && inRows.length === cur.inputs.length) {
       cur.inputNames = inRows.map((r) => String(r.name || '').trim().slice(0, 16));
@@ -451,6 +506,7 @@ function inspectNode(node) {
       });
     } else {
       outRows.forEach((r, i) => engine.setPortName(n.id, 'out', i, r.name));
+    }
     }
     engine.bump();
     closeModal();
@@ -508,8 +564,9 @@ function updateToolbar() {
   );
   document.querySelector('[data-action="up-level"]').disabled = run || activeLevel === 0;
   document.querySelector('[data-action="delete"]').disabled = run || !hasSel;
-  ['add-input', 'add-output', 'add-nand'].forEach((a) => {
-    document.querySelector(`[data-action="${a}"]`).disabled = run;
+  ['add-input', 'add-output', 'add-nand', 'add-const'].forEach((a) => {
+    const el = document.querySelector(`[data-action="${a}"]`);
+    if (el) el.disabled = run;
   });
 }
 
@@ -727,7 +784,7 @@ function pasteClipboard() {
     c.id = null; // let addNode mint a fresh id
     const newNode = engine.addNode(c.kind, c.x + off, c.y + off, {
       value: c.value, inputNames: c.inputNames, outputNames: c.outputNames,
-      name: c.name, ref: c.ref,
+      name: c.name, ref: c.ref, memo: c.memo, color: c.color,
     });
     idMap.set(src.id, newNode.id);
   }
@@ -819,6 +876,7 @@ document.querySelectorAll('[data-action]').forEach((btn) => {
     if (a === 'add-input') addNode(NodeKind.INPUT);
     else if (a === 'add-output') addNode(NodeKind.OUTPUT);
     else if (a === 'add-nand') addNode(NodeKind.NAND);
+    else if (a === 'add-const') addNode(NodeKind.CONST);
     else if (a === 'encapsulate') encapsulateSelection();
     else if (a === 'open-node') {
       const id = [...interactor.selection][0];
@@ -842,7 +900,7 @@ function seed() {
   engine.clockStep();
   updateClockCounter();
   setStatus('NAND(A=0,B=1)=1 · Space advances clock');
-  console.info('[nandmorphic] BUILD B4 · library/port reorder');
+  console.info(`[nandmorphic] BUILD ${BUILD_ID}`);
 }
 
 // Keyboard shortcuts
@@ -860,6 +918,7 @@ window.addEventListener('keydown', (e) => {
   else if (e.key.toLowerCase() === 'i' && engine.mode !== 'run') addNode(NodeKind.INPUT);
   else if (e.key.toLowerCase() === 'o' && engine.mode !== 'run') addNode(NodeKind.OUTPUT);
   else if (e.key.toLowerCase() === 'n' && engine.mode !== 'run') addNode(NodeKind.NAND);
+  else if (e.key.toLowerCase() === 'k' && engine.mode !== 'run') addNode(NodeKind.CONST);
   else if (e.key.toLowerCase() === 'e' && engine.mode !== 'run') encapsulateSelection();
   else if (e.key === 'c' && engine.mode !== 'run') doClock();
   else if (e.key === 'Escape') {

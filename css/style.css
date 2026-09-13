@@ -13,6 +13,7 @@
   --input: #a5d6ff;
   --output: #c3e88d;
   --custom: #d2a8ff;
+  --const: #e3b341;
   --node: #8b949e;
 
   --on-accent: #0d1117;
@@ -52,6 +53,7 @@ html[data-theme="light"] {
   --input: #0969da;
   --output: #1a7f37;
   --custom: #9b60d1;
+  --const: #9a6700;
   --node: #57606a;
 
   --on-accent: #ffffff;

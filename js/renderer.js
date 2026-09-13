@@ -16,6 +16,7 @@ const COLORS = {
   [NodeKind.INPUT]: '#a5d6ff',
   [NodeKind.OUTPUT]: '#c3e88d',
   [NodeKind.CUSTOM]: '#d2a8ff',
+  [NodeKind.CONST]: '#e3b341',
 };
 
 const KIND_VARS = {
@@ -23,6 +24,7 @@ const KIND_VARS = {
   [NodeKind.INPUT]: '--input',
   [NodeKind.OUTPUT]: '--output',
   [NodeKind.CUSTOM]: '--custom',
+  [NodeKind.CONST]: '--const',
 };
 
 function cssVar(name, fallback) {
@@ -56,7 +58,7 @@ export function nodeBox(node, values) {
   return nodeSize(node, longestText(node, values));
 }
 
-export function draw(ctx, engine, view, selection, hover) {
+export function draw(ctx, engine, view, selection, hover, hoverPort = null) {
   const dpr = window.devicePixelRatio || 1;
   const w = ctx.canvas.width;
   const h = ctx.canvas.height;
@@ -84,7 +86,8 @@ export function draw(ctx, engine, view, selection, hover) {
 
   // nodes
   for (const n of nodes) {
-    drawNode(ctx, n, values, selection.has(n.id), hover === n.id);
+    const hp = hoverPort && hoverPort.node && hoverPort.node.id === n.id ? hoverPort : null;
+    drawNode(ctx, n, values, selection.has(n.id), hover === n.id, hp);
   }
 
   ctx.restore();
@@ -93,6 +96,7 @@ export function draw(ctx, engine, view, selection, hover) {
 function outletValue(node, values, srcPort = 0) {
   if (node.kind === NodeKind.OUTPUT) return (values.get(node.id) || 0) | 0;
   if (node.kind === NodeKind.INPUT) return node.value | 0;
+  if (node.kind === NodeKind.CONST) return node.value | 0;
   if (node.kind === NodeKind.NAND) return (values.get(node.id) || 0) | 0;
   if (node.kind === NodeKind.CUSTOM) {
     const outs = values.get(node.id);
@@ -141,14 +145,16 @@ function drawWire(ctx, src, srcPort, dst, port, active, values) {
   }
 }
 
-function drawNode(ctx, node, values, selected, hover) {
-  const color = cssVar(KIND_VARS[node.kind], COLORS[node.kind]) || cssVar('--node', '#8b949e');
+function drawNode(ctx, node, values, selected, hover, hoverPort) {
+  const baseVar = cssVar(KIND_VARS[node.kind], COLORS[node.kind]) || cssVar('--node', '#8b949e');
+  // per-instance color override (all kinds)
+  const color = (node.color && /^#[0-9a-fA-F]{3,8}$/.test(node.color)) ? node.color : baseVar;
   const { w, h } = nodeBox(node, values);
   const hw = w / 2, hh = h / 2;
 
   ctx.save();
 
-  // body: rounded rect. INPUT/OUTPUT brightness tracks live state.
+  // body: rounded rect. INPUT/OUTPUT/CONST brightness tracks live state.
   const bodyColor = stateAwareColor(node, values, color);
 
   roundRectPath(ctx, node.x - hw, node.y - hh, w, h, 8);
@@ -176,7 +182,7 @@ function drawNode(ctx, node, values, selected, hover) {
       ctx.fillStyle = cssVar('--text-dim', '#c9d1d9');
       ctx.fillText(nm, pos.x - 8, pos.y);
     }
-    drawPort(ctx, pos.x, pos.y, true);
+    drawPort(ctx, pos.x, pos.y, true, !!(hoverPort && hoverPort.dir === 'in' && hoverPort.port === p));
   }
   for (let p = 0; p < outputPortCount(node); p++) {
     const pos = outputPortPos(node, p, hw);
@@ -187,17 +193,29 @@ function drawNode(ctx, node, values, selected, hover) {
       ctx.fillStyle = cssVar('--text-dim', '#c9d1d9');
       ctx.fillText(nm, pos.x + 8, pos.y);
     }
-    drawPort(ctx, pos.x, pos.y, false);
+    drawPort(ctx, pos.x, pos.y, false, !!(hoverPort && hoverPort.dir === 'out' && hoverPort.port === p));
+  }
+  // per-instance memo below the body
+  if (node.memo) {
+    ctx.font = '500 10px "Segoe UI", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = cssVar('--text-dim', '#c9d1d9');
+    const lines = String(node.memo).split('\n').slice(0, 3);
+    lines.forEach((ln, li) => {
+      ctx.fillText(ln.slice(0, 32), node.x, node.y + hh + 4 + li * 12);
+    });
   }
 
   ctx.restore();
 }
 
-// INPUT/OUTPUT node background brightness tracks its live value.
+// INPUT/OUTPUT/CONST node background brightness tracks its live value.
 // CUSTOM follows its live outputs (bright if any output port is 1).
 function stateAwareColor(node, values, base) {
   let v = 0;
   if (node.kind === NodeKind.INPUT) v = node.value | 0;
+  else if (node.kind === NodeKind.CONST) v = node.value | 0;
   else if (node.kind === NodeKind.OUTPUT) v = (values.get(node.id) || 0) | 0;
   else if (node.kind === NodeKind.CUSTOM) {
     const outs = values.get(node.id);
@@ -215,6 +233,7 @@ function stateAwareColor(node, values, base) {
 function centerLabel(node, values) {
   switch (node.kind) {
     case NodeKind.INPUT: return node.name || (node.value ? '1' : '0');
+    case NodeKind.CONST: return node.name || String(node.value | 0);
     case NodeKind.OUTPUT: return node.name || String((values.get(node.id) || 0) | 0);
     case NodeKind.NAND: return node.name || 'NAND';
     case NodeKind.CUSTOM: return node.name || 'CUSTOM';
@@ -236,14 +255,14 @@ function roundRectPath(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-function drawPort(ctx, x, y, isInput = false) {
+function drawPort(ctx, x, y, isInput = false, hovered = false) {
   const fill = cssVar('--port-fill', '#e6edf3');
   ctx.beginPath();
-  ctx.arc(x, y, PORT_R, 0, Math.PI * 2);
-  ctx.fillStyle = fill;
+  ctx.arc(x, y, hovered ? PORT_R + 2 : PORT_R, 0, Math.PI * 2);
+  ctx.fillStyle = hovered ? '#7ee787' : fill;
   ctx.fill();
-  ctx.lineWidth = 1.5;
-  ctx.strokeStyle = isInput ? cssVar('--port-stroke', '#8b949e') : fill;
+  ctx.lineWidth = hovered ? 2.5 : 1.5;
+  ctx.strokeStyle = hovered ? '#7ee787' : (isInput ? cssVar('--port-stroke', '#8b949e') : fill);
   ctx.stroke();
 }
 

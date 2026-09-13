@@ -1,6 +1,17 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import crypto from 'crypto';
+import { execSync } from 'child_process';
+
+function buildId() {
+  if (process.env.BUILD_HASH) return String(process.env.BUILD_HASH).slice(0, 7);
+  try {
+    return execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim().slice(0, 7) || 'dev';
+  } catch {
+    return 'dev';
+  }
+}
+const BUILD_ID = buildId();
 
 const SRC_DIR = 'js';
 const DIST_DIR = 'dist';
@@ -34,6 +45,7 @@ for (const f of files) {
     content = content.replaceAll(`'./${orig}'`, `'./${hashed}'`);
     content = content.replaceAll(`"./${orig}"`, `"./${hashed}"`);
   }
+  content = content.replaceAll('__BUILD_ID__', BUILD_ID);
   writeFileSync(join(DIST_JS, mapped[f]), content);
 }
 
@@ -44,5 +56,5 @@ writeFileSync(join(DIST_DIR, 'index.html'), html);
 
 writeFileSync(join(DIST_CSS, 'style.css'), readFileSync('css/style.css', 'utf-8'));
 
-console.log('Build complete. JS hashes:');
+console.log(`Build complete (BUILD ${BUILD_ID}). JS hashes:`);
 for (const [f, h] of Object.entries(hashes)) console.log(`  ${f} → ${mapped[f]}`);

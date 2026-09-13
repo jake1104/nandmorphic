@@ -76,6 +76,8 @@ function evaluateCircuit(circuit, inputValues, definitions) {
     if (!n) { visiting.delete(id); return 0; }
     if (n.kind === 'input') {
       r = values.get(id) | 0;
+    } else if (n.kind === 'const') {
+      r = n.value | 0;
     } else if (n.kind === 'nand') {
       const ins = (deps.get(id) || []).slice().sort((a, b) => a.port - b.port);
       const a = ins[0] !== undefined ? readFrom(ins[0].from, ins[0].srcPort) : 0;
