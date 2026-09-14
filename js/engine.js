@@ -27,7 +27,9 @@ export class Engine {
     this.version++;
     this._analysis = null;
     this._values.clear();
-    this._seqValues.clear();
+    // NOTE: _seqValues (latched sequential state) must survive bump().
+    // Clearing it here wiped clocked state on every edit AND on every
+    // clockStep (which bumps), so sequential circuits never held state.
   }
 
   setMode(m) { this.mode = m; this.bump(); }
@@ -528,17 +530,43 @@ export class Engine {
     return values;
   }
 
-  // Sequential evaluation: only sequential nodes, using registered values
+  // Sequential evaluation on clock edge.
+  // - Loops with a stable state (latches) iterate to a fixpoint so the
+  //   latched result doesn't depend on node order.
+  // - Loops with no stable state (odd-inversion rings) can never converge:
+  //   fall back to one synchronous step from the frozen pre-edge state so
+  //   oscillators advance deterministically instead of freezing.
   evalSequential() {
     const { sequential } = this.analyzeCircuit();
-    const nextSeq = new Map(this._seqValues);
-    for (const id of sequential) {
-      const node = this.nodes.get(id);
-      if (!node) continue;
-      const out = this.evalNode(node, this._values);
-      nextSeq.set(id, out);
+    if (sequential.size === 0) return;
+    // Frozen pre-edge state: current values + latched sequential values.
+    const pre = new Map(this._values);
+    for (const [id, v] of this._seqValues) pre.set(id, v);
+    const next = new Map(this._seqValues);
+    const view = new Map(pre);
+    let converged = false;
+    for (let pass = 0; pass < 16 && !converged; pass++) {
+      converged = true;
+      for (const id of sequential) {
+        const node = this.nodes.get(id);
+        if (!node) continue;
+        const out = this.evalNode(node, view);
+        if (!seqEqual(next.get(id), out)) {
+          next.set(id, out);
+          view.set(id, out);
+          converged = false;
+        }
+      }
     }
-    this._seqValues = nextSeq;
+    if (!converged) {
+      next.clear();
+      for (const id of sequential) {
+        const node = this.nodes.get(id);
+        if (!node) continue;
+        next.set(id, this.evalNode(node, pre));
+      }
+    }
+    this._seqValues = next;
     // Update main values with new sequential outputs
     for (const [id, val] of this._seqValues) {
       this._values.set(id, val);
@@ -547,6 +575,7 @@ export class Engine {
 
   // Full evaluation: sequential (on clock edge) -> combinational propagation
   evaluate() {
+    this._values.clear();
     // Initialize values from INPUT/CONST nodes
     for (const node of this.getNodes()) {
       if (node.kind === NodeKind.INPUT || node.kind === NodeKind.CONST) {
@@ -567,6 +596,8 @@ export class Engine {
     // Rising edge: 0 -> 1
     if (this.clockPhase === 0) {
       this.clockPhase = 1;
+      this.evaluate(); // settle current combinational state first so the
+                       // edge latches settled inputs, not a stale _values map
       this.evalSequential();
       this.evalCombinational(this._values);
     } else {
@@ -809,6 +840,21 @@ export class Engine {
 function ensureNames(arr, n) {
   const a = (arr && arr.length === n) ? arr.slice() : new Array(n).fill('');
   while (a.length < n) a.push(''); return a;
+}
+
+// Sequential latch values may be scalars (0|1) or arrays (CUSTOM multi-out).
+// A missing latch (undefined) is never equal to a computed value —
+// otherwise a node whose next state is 0 would never get latched.
+function seqEqual(a, b) {
+  if (a === undefined || b === undefined) return a === b;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    const x = Array.isArray(a) ? a : [a];
+    const y = Array.isArray(b) ? b : [b];
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if ((x[i] | 0) !== (y[i] | 0)) return false;
+    return true;
+  }
+  return (a | 0) === (b | 0);
 }
 
 // Compare two definition circuits structurally, ignoring node positions.

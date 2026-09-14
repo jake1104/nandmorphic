@@ -11,7 +11,7 @@
 
 import { NodeKind } from './model.js';
 import { nodeAt, outputPortAt, inputPortAt, NODE_HIT_R, nodeBox } from './renderer.js';
-import { inputPortPos, outputPortPos, inputPortCount as inCount, outputPortCount as outCount } from './ports.js';
+import { inputPortPos, outputPortPos, inputPortCount, outputPortCount } from './ports.js';
 
 function cssVar(name, fallback) {
   const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -270,7 +270,7 @@ export class Interactor {
     let bestOut = null;
     let bestOutDist = Infinity;
     for (const n of nodes) {
-      const inN = inCount(n);
+      const inN = inputPortCount(n);
       const hw = nodeBox(n, values).w / 2;
       for (let port = 0; port < inN; port++) {
         const pos = inputPortPos(n, port, hw);
@@ -279,7 +279,7 @@ export class Interactor {
         const d = dx * dx + dy * dy;
         if (d < bestInDist) { bestInDist = d; bestIn = { node: n, port, dist: d }; }
       }
-      const outN = outCount(n);
+      const outN = outputPortCount(n);
       for (let port = 0; port < outN; port++) {
         const pos = outputPortPos(n, port, hw);
         const dx = p.x - pos.x;
@@ -465,5 +465,5 @@ export class Interactor {
 }
 
 function inputPortCountFor(node) {
-  return inCount(node);
+  return inputPortCount(node);
 }

@@ -28,10 +28,22 @@ function parseImports(src) {
 }
 
 function stripModuleSyntax(src) {
+  // Collect `X as Y` aliases before stripping, and re-emit them as consts
+  // so bundled output keeps working even if a source file uses aliases.
+  const aliases = [];
+  const namedRe = /^[ \t]*import\s*\{([\s\S]*?)\}\s*from\s*['"][^'"]+['"]\s*;?[ \t]*\r?$/gm;
+  let m;
+  while ((m = namedRe.exec(src)) !== null) {
+    for (const part of m[1].split(',')) {
+      const mm = part.trim().match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
+      if (mm) aliases.push(`const ${mm[2]} = ${mm[1]};`);
+    }
+  }
   // Remove static import statements (incl. multi-line).
   let out = src.replace(/^[ \t]*import\s+[\s\S]*?\sfrom\s+['"][^'"]+['"]\s*;?[ \t]*\r?$/gm, '');
   // `export const|function|class` (incl. `export async function`) → plain declaration.
   out = out.replace(/^([ \t]*)export\s+(?=(?:async\s+)?(?:const|function|class)\b)/gm, '$1');
+  if (aliases.length) out += `\n${aliases.join('\n')}\n`;
   return out;
 }
 
