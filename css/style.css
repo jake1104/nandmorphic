@@ -206,6 +206,16 @@ html, body {
   flex-shrink: 0;
 }
 .lib-item .lib-del:hover { color: var(--danger); background: var(--danger-bg); }
+.lib-item .lib-gear {
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.lib-item .lib-gear:hover { color: var(--accent); background: var(--accent-bg); }
+.port-row input[type="text"]:disabled { opacity: 0.55; cursor: not-allowed; }
 /* Drag-to-reorder handle (braille dots) */
 .drag-handle {
   color: var(--text-dim);

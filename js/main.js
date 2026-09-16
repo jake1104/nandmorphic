@@ -1,6 +1,6 @@
 // Main entry point: wires engine, renderer, interactor, and UI.
 
-import { Engine, sameCircuitStructure } from './engine.js';
+import { Engine, sameCircuitStructure, preservePortOrder } from './engine.js';
 import { draw } from './renderer.js';
 import { Interactor } from './interact.js';
 import { NodeKind } from './model.js';
@@ -174,20 +174,28 @@ function levelTitle(i) {
 
 function saveCurrentLevel() {
   levels[activeLevel].json = engine.toJSON();
+  levels[activeLevel].savedVersion = engine.version;
   levels[activeLevel].viewState = { x: view.x, y: view.y, zoom: view.zoom };
   levels[activeLevel].dirty = false;
 }
 
-function getCurrentLevelJSON() {
-  return engine.toJSON();
+// Load a level snapshot into the engine and mark it clean. Every navigation
+// path must go through here so the version-based dirty check stays in sync.
+function loadLevelSnapshot(i) {
+  if (levels[i].json) engine.fromJSON(levels[i].json);
+  else engine.fromJSON({ version: 2, mode: engine.mode, definitions: [], nodes: [] });
+  levels[i].savedVersion = engine.version;
+  levels[i].dirty = false;
 }
 
 function isLevelDirty() {
   if (activeLevel === 0) return false;
   const f = levels[activeLevel];
-  if (!f.json) return true;
-  const current = getCurrentLevelJSON();
-  return JSON.stringify(current) !== JSON.stringify(f.json);
+  // O(1) version comparison. The old implementation stringified the whole
+  // workspace (definitions included) on every frame/renderTabs pass, which
+  // froze the UI for seconds-to-minutes as circuits grew (#2).
+  if (f.savedVersion === undefined) return true;
+  return engine.version !== f.savedVersion;
 }
 
 function switchToLevel(i) {
@@ -198,11 +206,10 @@ function switchToLevel(i) {
     activeLevel--;
     // Reload the parent snapshot: the next commitLevel (if any) must operate
     // on the parent's nodes, not the just-committed child's nodes.
-    engine.fromJSON(levels[activeLevel].json);
+    loadLevelSnapshot(activeLevel);
   }
   activeLevel = i;
-  if (levels[i].json) engine.fromJSON(levels[i].json);
-  else engine.fromJSON({ version: 2, mode: engine.mode, definitions: [], nodes: [] });
+  loadLevelSnapshot(i);
   interactor.selection.clear();
   if (levels[i].viewState) {
     view.x = levels[i].viewState.x;
@@ -221,6 +228,9 @@ function commitLevel() {
   const f = levels[activeLevel];
   const originalDef = f.containerRef ? engine.definitions.get(f.containerRef) : null;
   const circuit = buildDefinitionFromCircuit(engine, engine.getNodes().map((n) => n.id));
+  // Keep the port order the user arranged (inspector/library reorder), keyed
+  // by stable internal node ids; new nodes append at the end (#3).
+  if (originalDef && originalDef.circuit) preservePortOrder(originalDef.circuit, circuit);
   const defName = originalDef ? originalDef.name : 'custom';
   let newDef = engine.registerDefinition(circuit, defName);
   if (newDef.circuit !== circuit && !sameCircuitStructure(newDef.circuit, circuit)) {
@@ -247,7 +257,10 @@ function commitLevel() {
   if (f.containerRef && activeLevel > 0) {
     const parentLevel = levels[activeLevel - 1];
     if (parentLevel.json) {
-      const data = JSON.parse(JSON.stringify(parentLevel.json));
+      // Mutate our own snapshot in place: the old deep-clone round-trip
+      // (JSON.parse(JSON.stringify(...))) copied the entire workspace on
+      // every save (#2).
+      const data = parentLevel.json;
       // Update definitions list
       const defIdx = data.definitions?.findIndex((d) => d.id === f.containerRef);
       if (defIdx >= 0) {
@@ -277,6 +290,7 @@ function commitLevel() {
   }
   f.dirty = false;
   f.json = engine.toJSON();
+  f.savedVersion = engine.version;
   return true;
 }
 
@@ -300,7 +314,7 @@ function up() {
   commitLevel();
   levels.pop();
   activeLevel--;
-  engine.fromJSON(levels[activeLevel].json);
+  loadLevelSnapshot(activeLevel);
   interactor.selection.clear();
   if (levels[activeLevel].viewState) {
     view.x = levels[activeLevel].viewState.x;
@@ -322,9 +336,9 @@ function goToLevel(i) {
     activeLevel--;
     // Reload the parent snapshot: the next commitLevel (if any) must operate
     // on the parent's nodes, not the just-committed child's nodes.
-    engine.fromJSON(levels[activeLevel].json);
+    loadLevelSnapshot(activeLevel);
   }
-  engine.fromJSON(levels[i].json);
+  loadLevelSnapshot(i);
   interactor.selection.clear();
   if (levels[i].viewState) {
     view.x = levels[i].viewState.x;
@@ -398,10 +412,14 @@ function inspectNode(node) {
   }));
   const outRows = outNames.map((nm, i) => ({ name: nm || '', orig: i }));
   const isConst = n.kind === NodeKind.CONST;
+  // I/O nodes expose their name as the port itself: those port-name fields
+  // are locked (#5). Only CUSTOM/NAND keep editable port names.
+  const inLocked = n.kind === NodeKind.OUTPUT;
+  const outLocked = n.kind === NodeKind.INPUT;
   const renderRows = () => {
     const host = document.getElementById('insp-ports');
     if (!host) return;
-    host.innerHTML = renderPortRows('in', inRows) + renderPortRows('out', outRows);
+    host.innerHTML = renderPortRows('in', inRows, inLocked) + renderPortRows('out', outRows, outLocked);
     host.querySelectorAll('input[data-row]').forEach((el) => {
       el.oninput = () => {
         const arr = el.dataset.dir === 'in' ? inRows : outRows;
@@ -449,38 +467,20 @@ function inspectNode(node) {
     engine.setNodeMemo(n.id, document.getElementById('insp-memo').value);
     engine.setNodeColor(n.id, document.getElementById('insp-color').value.trim());
     if (isCustom) {
-      // Shared kind: names go to the definition, wiring reorder applies to
-      // every instance of the same kind via engine.swapNodePorts().
-      inRows.forEach((r, i) => engine.setPortName(n.id, 'in', i, r.name));
-      outRows.forEach((r, i) => engine.setPortName(n.id, 'out', i, r.name));
-      // input wiring reorder for this instance only (connections differ)
-      if (cur.inputs && inRows.length === cur.inputs.length) {
-        // detect reorder by orig mapping
-        const orderChanged = inRows.some((r, idx) => r.orig !== idx);
-        if (orderChanged) {
-          const newInputs = inRows.map((r) => r.src);
-          const newSp = inRows.map((r) => r.sport | 0);
-          cur.inputs = newInputs;
-          cur.sourcePorts = newSp;
-        } else {
-          cur.inputs = inRows.map((r) => r.src);
-          cur.sourcePorts = inRows.map((r) => r.sport | 0);
-        }
-      }
-      // output reorder is global (shared): apply via sequential swaps
-      const curOrder = outRows.map((r) => r.orig);
-      for (let target = 0; target < curOrder.length; target++) {
-        const at = curOrder.indexOf(target);
-        if (at !== target) {
-          engine.swapNodePorts(n.id, 'out', at, target);
-          const tmp = curOrder[at];
-          curOrder[at] = curOrder[target];
-          curOrder[target] = tmp;
-        }
-      }
+      // Shared kind: the drag-reordered list is persisted to the definition
+      // itself via reorderDefinitionPorts (#3), so it survives re-open,
+      // commits and reloads — every instance of the kind follows.
+      // Names follow the rows to their new positions.
+      const defId = cur.ref;
+      const orderIn = inRows.map((r) => r.orig);
+      const orderOut = outRows.map((r) => r.orig);
+      if (orderIn.length && orderIn.some((o, k) => o !== k)) engine.reorderDefinitionPorts(defId, 'in', orderIn);
+      if (orderOut.length && orderOut.some((o, k) => o !== k)) engine.reorderDefinitionPorts(defId, 'out', orderOut);
+      inRows.forEach((r, i) => engine.setSharedPortName(defId, 'in', i, r.name));
+      outRows.forEach((r, i) => engine.setSharedPortName(defId, 'out', i, r.name));
     } else {
     // Apply reordered input ports (names + wiring follow the rows).
-    if (cur.inputs && inRows.length === cur.inputs.length) {
+    if (!inLocked && cur.inputs && inRows.length === cur.inputs.length) {
       cur.inputNames = inRows.map((r) => String(r.name || '').trim().slice(0, 16));
       cur.inputs = inRows.map((r) => r.src);
       cur.sourcePorts = inRows.map((r) => r.sport | 0);
@@ -488,7 +488,7 @@ function inspectNode(node) {
       inRows.forEach((r, i) => engine.setPortName(n.id, 'in', i, r.name));
     }
     // Apply reordered output ports; remap downstream wires to follow.
-    if (cur.outputNames && outRows.length === cur.outputNames.length) {
+    if (!outLocked && cur.outputNames && outRows.length === cur.outputNames.length) {
       const pos = new Array(outRows.length);
       outRows.forEach((r, newIdx) => { pos[r.orig] = newIdx; });
       cur.outputNames = outRows.map((r) => String(r.name || '').trim().slice(0, 16));
@@ -514,15 +514,77 @@ function inspectNode(node) {
   };
 }
 
-function renderPortRows(dir, rows) {
+// Library settings modal: the same name + port-name + reorder editing as the
+// double-click node inspector, operated directly on the shared definition
+// (#3). Used by the ⚙ button on each library entry.
+function inspectDefinition(defId) {
+  const def = engine.definitions.get(defId);
+  if (!def) { setStatus('definition not found'); return; }
+  const ports = (def.circuit && def.circuit.ports) || { inputs: [], outputs: [] };
+  const inRows = (ports.inputs || []).map((nm, i) => ({ name: nm || '', orig: i }));
+  const outRows = (ports.outputs || []).map((nm, i) => ({ name: nm || '', orig: i }));
+  const renderRows = () => {
+    const host = document.getElementById('insp-ports');
+    if (!host) return;
+    host.innerHTML = renderPortRows('in', inRows) + renderPortRows('out', outRows);
+    host.querySelectorAll('input[data-row]').forEach((el) => {
+      el.oninput = () => {
+        const arr = el.dataset.dir === 'in' ? inRows : outRows;
+        const row = arr[+el.dataset.row];
+        if (row) row.name = el.value;
+      };
+    });
+  };
+  modalRoot.classList.add('open');
+  modalRoot.innerHTML = `
+    <div class="modal">
+      <h3>LIBRARY — ${escapeHtml(def.name || 'custom')}</h3>
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">Shared kind: name + ports apply to every instance of this type (same as double-click settings).</p>
+      <label>Name</label>
+      <input type="text" id="insp-name" value="${escapeHtml(def.name || '')}" />
+      <div class="insp-ports" id="insp-ports"></div>
+      <div class="actions">
+        <button class="btn" id="modal-cancel">Cancel</button>
+        <button class="btn" id="modal-ok" style="background:var(--accent);color:var(--on-accent);border-color:var(--accent)">OK</button>
+      </div>
+    </div>`;
+  renderRows();
+  enableDragReorder(document.getElementById('insp-ports'), '.port-row', (items) => {
+    const dir = items.length ? items[0].dataset.dir : 'in';
+    const order = items.map((it) => +it.dataset.row).filter((n) => !Number.isNaN(n));
+    const arr = dir === 'in' ? inRows : outRows;
+    if (order.length !== arr.length) return;
+    const next = order.map((k) => arr[k]);
+    for (let i = 0; i < arr.length; i++) arr[i] = next[i];
+    renderRows();
+  });
+  document.getElementById('modal-cancel').onclick = closeModal;
+  document.getElementById('modal-ok').onclick = () => {
+    const live = engine.definitions.get(defId);
+    if (!live) { closeModal(); return; }
+    engine.setSharedName(defId, document.getElementById('insp-name').value.trim());
+    const orderIn = inRows.map((r) => r.orig);
+    const orderOut = outRows.map((r) => r.orig);
+    if (orderIn.length && orderIn.some((o, k) => o !== k)) engine.reorderDefinitionPorts(defId, 'in', orderIn);
+    if (orderOut.length && orderOut.some((o, k) => o !== k)) engine.reorderDefinitionPorts(defId, 'out', orderOut);
+    inRows.forEach((r, i) => engine.setSharedPortName(defId, 'in', i, r.name));
+    outRows.forEach((r, i) => engine.setSharedPortName(defId, 'out', i, r.name));
+    closeModal();
+    renderLibrary();
+    render();
+  };
+}
+
+function renderPortRows(dir, rows, locked = false) {
   if (rows.length === 0) return '';
   const label = dir === 'in' ? 'Input ports' : 'Output ports';
-  const reorder = rows.length > 1;
-  return `<div class="port-section"><div class="port-head">${label}</div>` +
+  const reorder = rows.length > 1 && !locked;
+  const note = locked ? ' <span style="font-weight:400">(= node name, locked)</span>' : '';
+  return `<div class="port-section"><div class="port-head">${label}${note}</div>` +
     rows.map((row, i) => `
-      <div class="port-row">
+      <div class="port-row" data-dir="${dir}" data-row="${i}">
         <span class="port-idx">${i}</span>
-        <input type="text" data-dir="${dir}" data-row="${i}" value="${escapeHtml(row.name || '')}" placeholder="name" />
+        <input type="text" data-dir="${dir}" data-row="${i}" value="${escapeHtml(row.name || '')}" placeholder="${locked ? 'node name' : 'name'}" ${locked ? 'disabled title="I/O port name follows the node name"' : ''} />
         ${reorder ? `<span class="drag-handle" data-dir="${dir}" data-row="${i}" title="Drag to reorder">⠿</span>` : ''}
       </div>`).join('') + `</div>`;
 }
@@ -599,6 +661,7 @@ function renderLibrary() {
         <div class="name">${escapeHtml(d.name)}</div>
         <div class="desc">${d.inputs}→${d.outputs}${ticksLabel} · ${d.signature.bits.join(' ')}${blocked ? ' · would cycle' : ''}</div>
       </div>
+      <span class="lib-gear" data-gear="${d.id}" title="Settings (same as double-click)">⚙</span>
       <span class="lib-del" data-del="${d.id}" title="Delete this custom node">✕</span>
       <span class="drag-handle" title="Drag to reorder">⠿</span>`;
     item.addEventListener('click', () => {
@@ -615,6 +678,11 @@ function renderLibrary() {
     del.addEventListener('click', (e) => {
       e.stopPropagation();
       deleteDefinition(d);
+    });
+    const gear = item.querySelector('.lib-gear');
+    gear.addEventListener('click', (e) => {
+      e.stopPropagation();
+      inspectDefinition(d.id);
     });
     libraryEl.appendChild(item);
   }
@@ -737,7 +805,7 @@ function showDirtyCloseModal(levelIndex) {
       commitLevel();
       levels.pop();
       activeLevel--;
-      engine.fromJSON(levels[activeLevel].json);
+      loadLevelSnapshot(activeLevel);
       interactor.selection.clear();
       view.x = 0; view.y = 0; view.zoom = 1;
       refresh();
@@ -824,7 +892,7 @@ function importWorkspace(file) {
       const data = JSON.parse(reader.result);
       engine.fromJSON(data);
       levels.length = 0;
-      levels.push({ json: engine.toJSON(), viewState: { x: 0, y: 0, zoom: 1 }, containerRef: null, instanceId: null, dirty: false });
+      levels.push({ json: engine.toJSON(), savedVersion: engine.version, viewState: { x: 0, y: 0, zoom: 1 }, containerRef: null, instanceId: null, dirty: false });
       activeLevel = 0;
       interactor.selection.clear();
       view.x = 0; view.y = 0; view.zoom = 1;
@@ -970,7 +1038,7 @@ window.addEventListener('resize', resize);
 
 resize();
 initInteractor();
-levels.push({ json: engine.toJSON(), viewState: { x: 0, y: 0, zoom: 1 }, containerRef: null, instanceId: null, dirty: false });
+levels.push({ json: engine.toJSON(), savedVersion: engine.version, viewState: { x: 0, y: 0, zoom: 1 }, containerRef: null, instanceId: null, dirty: false });
 updateToolbar();
 updateModeBtn();
 renderLibrary();
