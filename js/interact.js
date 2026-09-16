@@ -182,7 +182,7 @@ export class Interactor {
         this.dragNode.x = p.x;
         this.dragNode.y = p.y;
       }
-      this.engine.bump();
+      this.engine.bumpLight();
       this.hover = this.dragNode.id;
       return;
     }
@@ -241,7 +241,7 @@ export class Interactor {
     this.snapTarget = null;
     this.snapSource = null;
     this.panStart = null;
-    this.engine.bump();
+    this.engine.bumpLight();
   }
 
   onDoubleClick(e) {
@@ -289,9 +289,9 @@ export class Interactor {
         if (d < bestOutDist) { bestOutDist = d; bestOut = { node: n, port, dist: d }; }
       }
     }
-    if (bestIn && bestInDist < 26 * 26) this.snapTarget = { node: bestIn.node, port: bestIn.port };
+    if (bestIn && bestInDist < 12 * 12) this.snapTarget = { node: bestIn.node, port: bestIn.port };
     else this.snapTarget = null;
-    if (bestOut && bestOutDist < 26 * 26) this.snapSource = { node: bestOut.node, port: bestOut.port };
+    if (bestOut && bestOutDist < 12 * 12) this.snapSource = { node: bestOut.node, port: bestOut.port };
     else this.snapSource = null;
   }
 

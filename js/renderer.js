@@ -267,13 +267,7 @@ function drawPort(ctx, x, y, isInput = false, hovered = false) {
 }
 
 export function nodeAt(nodes, values, x, y) {
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const n = nodes[i];
-    const dx = n.x - x;
-    const dy = n.y - y;
-    if (dx * dx + dy * dy <= NODE_R * NODE_R * 1.4) return n;
-  }
-  // fallback: box hit-test on rounded rect
+  // Exact body hit-test: the click target is the visible rounded rect, nothing more.
   for (let i = nodes.length - 1; i >= 0; i--) {
     const n = nodes[i];
     const { w, h } = nodeBox(n, values);
@@ -282,9 +276,10 @@ export function nodeAt(nodes, values, x, y) {
   return null;
 }
 
-// Ports are clickable within this radius of their center, even when the port
-// hangs slightly off the node body edge.
-const PORT_HIT_R = 16;
+// Ports are drawn with PORT_R (see ports.js); the hit radius keeps a minimal
+// +2px tolerance so the visible circle stays clickable without swallowing
+// neighboring ports or node bodies.
+const PORT_HIT_R = 7;
 
 export function outputPortAt(node, x, y, values) {
   const hw = nodeBox(node, values).w / 2;
