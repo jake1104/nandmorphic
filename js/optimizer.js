@@ -15,6 +15,9 @@ export function buildSignatureForCustom(circuit, definitions) {
   const inputs = nodes.filter((n) => n.kind === 'input').sort((a, b) => a.inputIndex - b.inputIndex);
   const outputs = nodes.filter((n) => n.kind === 'output').sort((a, b) => a.outputIndex - b.outputIndex);
   const n = inputs.length;
+  // Guard: 2^n truth-table rows explode past ~12 inputs (minutes-long save).
+  // Callers (engine.registerDefinition) bypass dedup for such circuits.
+  if (n > 12) return { inputCount: n, outputCount: outputs.length, bits: [], approx: true };
   const rows = 1 << n;
   const bits = new Array(outputs.length).fill(0);
 
@@ -32,6 +35,11 @@ export function buildSignatureForCustom(circuit, definitions) {
 // Canonical string that is identical for any two behaviorally-equivalent
 // circuits (up to input/output order, which we deliberately fix by index).
 export function canonicalSignature(signature, circuit) {
+  if (signature.approx) {
+    const nn = (circuit.nodes || []).length;
+    const ne = (circuit.edges || []).length;
+    return `approx:i${signature.inputCount}:o${signature.outputCount}:${nn}n:${ne}e`;
+  }
   const { inputCount, outputCount, bits } = signature;
   return `i${inputCount}:o${outputCount}:${bits.join(',')}`;
 }

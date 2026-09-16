@@ -20,17 +20,23 @@ export class Engine {
     // analysis caches
     this._analysis = null;    // { sequential: Set(nodeId), combinational: Set(nodeId), order: nodeId[] }
     this._values = new Map(); // nodeId -> 0|1 (current output value)
+    this._valuesValid = false; // evaluate() cache flag, cleared by bump()
     this._seqValues = new Map(); // nodeId -> 0|1 (sequential node registered values)
   }
 
-  bump() {
+  bump(light = false) {
     this.version++;
-    this._analysis = null;
+    // Positional/value-only edits (drag, toggle, memo/color) keep the
+    // topology analysis: Tarjan SCC + topo order is only invalidated by
+    // structural edits. This keeps per-frame evaluate() O(n+e) cached.
+    if (!light) this._analysis = null;
     this._values.clear();
+    this._valuesValid = false;
     // NOTE: _seqValues (latched sequential state) must survive bump().
     // Clearing it here wiped clocked state on every edit AND on every
     // clockStep (which bumps), so sequential circuits never held state.
   }
+  bumpLight() { this.bump(true); }
 
   setMode(m) { this.mode = m; this.bump(); }
 
@@ -118,8 +124,7 @@ export class Engine {
     const n = this.nodes.get(id);
     if (n && n.kind === NodeKind.INPUT) {
       n.value = n.value ? 0 : 1;
-      this._values.set(id, n.value | 0);
-      this.bump();
+      this.bumpLight();
     }
   }
   // CONST toggles only in dev(edit) mode; locked in run mode.
@@ -128,21 +133,20 @@ export class Engine {
     if (!n || n.kind !== NodeKind.CONST) return false;
     if (this.mode !== Mode.DEV) return false;
     n.value = n.value ? 0 : 1;
-    this._values.set(id, n.value | 0);
-    this.bump();
+    this.bumpLight();
     return true;
   }
   setNodeMemo(nodeId, memo) {
     const n = this.nodes.get(nodeId);
     if (!n) return;
     n.memo = String(memo || '').slice(0, 500);
-    this.bump();
+    this.bumpLight();
   }
   setNodeColor(nodeId, color) {
     const n = this.nodes.get(nodeId);
     if (!n) return;
     n.color = String(color || '').slice(0, 32);
-    this.bump();
+    this.bumpLight();
   }
   // ---- Shared CUSTOM info: single source of truth = definitions ----
   customDefOf(node) {
@@ -230,7 +234,15 @@ export class Engine {
     if (!def || !def.circuit || !def.circuit.ports) return false;
     const list = dir === 'in' ? def.circuit.ports.inputs : def.circuit.ports.outputs;
     if (!list || port < 0 || port >= list.length) return false;
-    list[port] = String(name || '').slice(0, 16);
+    const trimmed = String(name || '').slice(0, 16);
+    list[port] = trimmed;
+    // Two-way sync (#4): the internal INPUT/OUTPUT node carrying this port
+    // follows the shared name, so "definition port name" and "internal I/O
+    // node name" never diverge.
+    for (const cn of def.circuit.nodes || []) {
+      if (dir === 'in' && cn.kind === 'input' && (cn.inputIndex | 0) === port) cn.name = trimmed;
+      if (dir === 'out' && cn.kind === 'output' && (cn.outputIndex | 0) === port) cn.name = trimmed;
+    }
     this.syncCustomInstances(defId);
     this.bump();
     return true;
@@ -238,6 +250,10 @@ export class Engine {
   setPortName(nodeId, dir, port, name) {
     const n = this.nodes.get(nodeId);
     if (!n) return;
+    // I/O nodes expose their name as the port itself (#5): no separate
+    // port-name editing for INPUT outputs / OUTPUT inputs.
+    if (n.kind === NodeKind.INPUT && dir === 'out') return;
+    if (n.kind === NodeKind.OUTPUT && dir === 'in') return;
     if (n.kind === NodeKind.CUSTOM) {
       this.setSharedPortName(n.ref, dir, port, name);
       return;
@@ -273,11 +289,11 @@ export class Engine {
         const names = def.circuit.ports.inputs;
         if (i < 0 || j < 0 || i >= names.length || j >= names.length) return false;
         [names[i], names[j]] = [names[j], names[i]];
-        // remap circuit-internal port order markers
+        // remap internal INPUT nodes' port order markers (inputIndex)
         (def.circuit.nodes || []).forEach((cn) => {
-          if (cn.kind === 'output') {
-            if (cn.outputIndex === i) cn.outputIndex = j;
-            else if (cn.outputIndex === j) cn.outputIndex = i;
+          if (cn.kind === 'input') {
+            if (cn.inputIndex === i) cn.inputIndex = j;
+            else if (cn.inputIndex === j) cn.inputIndex = i;
           }
         });
         this.nodes.forEach((m) => {
@@ -341,6 +357,58 @@ export class Engine {
         }
       });
     }
+    this.bump();
+    return true;
+  }
+  // Reorder a definition's ports to `newOrder` (array of old indices in the
+  // new order, e.g. [2,0,1]). Shared kind-level reorder used by both the
+  // node inspector and the library settings modal, so a drag-reordered port
+  // list is persisted to the definition itself (#3).
+  reorderDefinitionPorts(defId, dir, newOrder) {
+    const def = this.definitions.get(defId);
+    if (!def || !def.circuit || !def.circuit.ports) return false;
+    const names = dir === 'in' ? def.circuit.ports.inputs : def.circuit.ports.outputs;
+    if (!names || !Array.isArray(newOrder) || newOrder.length !== names.length) return false;
+    const seen = new Set(newOrder);
+    if (seen.size !== names.length) return false;
+    for (const k of newOrder) if (!Number.isInteger(k) || k < 0 || k >= names.length) return false;
+    if (newOrder.every((o, k) => o === k)) return true; // noop, already in order
+    const reordered = newOrder.map((k) => names[k]);
+    for (let k = 0; k < names.length; k++) names[k] = reordered[k];
+    const oldToNew = new Array(names.length);
+    newOrder.forEach((old, k) => { oldToNew[old] = k; });
+    if (dir === 'in') {
+      (def.circuit.nodes || []).forEach((cn) => {
+        if (cn.kind === 'input' && Number.isInteger(cn.inputIndex)) cn.inputIndex = oldToNew[cn.inputIndex] ?? cn.inputIndex;
+      });
+      this.nodes.forEach((m) => {
+        if (m.kind !== NodeKind.CUSTOM || m.ref !== defId || !m.inputs) return;
+        m.inputs = newOrder.map((o) => m.inputs[o]);
+        m.sourcePorts = newOrder.map((o) => m.sourcePorts[o]);
+      });
+    } else {
+      (def.circuit.nodes || []).forEach((cn) => {
+        if (cn.kind === 'output' && Number.isInteger(cn.outputIndex)) cn.outputIndex = oldToNew[cn.outputIndex] ?? cn.outputIndex;
+      });
+      this.nodes.forEach((m) => {
+        if (!m.inputs) return;
+        for (let k = 0; k < m.inputs.length; k++) {
+          const src = m.inputs[k] ? this.nodes.get(m.inputs[k]) : null;
+          if (src && src.kind === NodeKind.CUSTOM && src.ref === defId) {
+            m.sourcePorts[k] = oldToNew[m.sourcePorts[k]] ?? m.sourcePorts[k];
+          }
+        }
+      });
+      this.definitions.forEach((d) => {
+        (d.circuit.edges || []).forEach((e) => {
+          const src = (d.circuit.nodes || []).find((cn) => cn.id === e.from);
+          if (src && src.kind === 'custom' && src.ref === defId) {
+            e.srcPort = oldToNew[e.srcPort] ?? e.srcPort;
+          }
+        });
+      });
+    }
+    this.syncCustomInstances(defId);
     this.bump();
     return true;
   }
@@ -573,8 +641,12 @@ export class Engine {
     }
   }
 
-  // Full evaluation: sequential (on clock edge) -> combinational propagation
+  // Full evaluation: sequential (on clock edge) -> combinational propagation.
+  // Result is cached until the next bump(): draw(), hover checks and overlay
+  // drawing all call evaluate() every frame, so recomputing Tarjan + custom
+  // simulation per call was the main per-frame cost (#2).
   evaluate() {
+    if (this._valuesValid) return this._values;
     this._values.clear();
     // Initialize values from INPUT/CONST nodes
     for (const node of this.getNodes()) {
@@ -588,6 +660,7 @@ export class Engine {
     }
     // Propagate combinational
     this.evalCombinational(this._values);
+    this._valuesValid = true;
     return this._values;
   }
 
@@ -605,7 +678,7 @@ export class Engine {
       this.clockPhase = 0;
       this.clock++;
     }
-    this.bump();
+    this.bumpLight();
     return this.clock;
   }
 
@@ -639,6 +712,16 @@ export class Engine {
   simulateDefinition(def, inputValues) { return simulateCircuit(def, this, inputValues); }
 
   registerDefinition(circuit, name) {
+    // Truth-table dedup is 2^n simulations: beyond ~12 inputs a save would
+    // hang for minutes (#2). Large circuits skip behavioral dedup and always
+    // allocate a fresh definition.
+    const probeInputs = (circuit.nodes || []).filter((n) => n.kind === 'input').length;
+    if (probeInputs > 12) {
+      const probeOutputs = (circuit.nodes || []).filter((n) => n.kind === 'output').length;
+      return this.createDefinition(circuit, name,
+        { inputCount: probeInputs, outputCount: probeOutputs, bits: [], approx: true },
+        `unique:${makeId('big')}`);
+    }
     const signature = buildSignatureForCustom(circuit, this.definitions);
     const canon = canonicalSignature(signature, circuit);
     for (const [, def] of this.definitions) if (def.canonical === canon) return def;
@@ -690,7 +773,7 @@ export class Engine {
         cn.y = m.y;
       }
     }
-    this.bump();
+    this.bumpLight();
     return true;
   }
   getNodes() { return Array.from(this.nodes.values()); }
@@ -878,6 +961,32 @@ export function sameCircuitStructure(a, b) {
     return { nodes, edges, ports: { inputs: ports.inputs || [], outputs: ports.outputs || [] } };
   };
   return JSON.stringify(strip(a)) === JSON.stringify(strip(b));
+}
+
+// Keep a definition's port order stable across commits (#3). Internal node
+// ids survive expand/commit round-trips, so ports of retained INPUT/OUTPUT
+// nodes follow the old definition's order; newly added nodes append at the end.
+export function preservePortOrder(oldCircuit, newCircuit) {
+  if (!oldCircuit || !newCircuit || !newCircuit.ports) return;
+  for (const kind of ['input', 'output']) {
+    const idxKey = kind === 'input' ? 'inputIndex' : 'outputIndex';
+    const ports = kind === 'input' ? newCircuit.ports.inputs : newCircuit.ports.outputs;
+    if (!ports) continue;
+    const oldNodes = (oldCircuit.nodes || [])
+      .filter((n) => n.kind === kind)
+      .sort((a, b) => ((a[idxKey] | 0) - (b[idxKey] | 0)));
+    const oldPos = new Map(oldNodes.map((n, k) => [n.id, k]));
+    const news = (newCircuit.nodes || []).filter((n) => n.kind === kind);
+    const nameById = new Map();
+    for (const nd of news) nameById.set(nd.id, ports[nd[idxKey] | 0] ?? '');
+    news.sort((a, b) => {
+      const oa = oldPos.has(a.id) ? oldPos.get(a.id) : 1e9;
+      const ob = oldPos.has(b.id) ? oldPos.get(b.id) : 1e9;
+      if (oa !== ob) return oa - ob;
+      return ((a[idxKey] | 0) - (b[idxKey] | 0));
+    });
+    news.forEach((nd, k) => { nd[idxKey] = k; ports[k] = nameById.get(nd.id) ?? ''; });
+  }
 }
 
 function portNamesOfDef(def, dir) {
