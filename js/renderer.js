@@ -27,10 +27,20 @@ const KIND_VARS = {
   [NodeKind.CONST]: '--const',
 };
 
-function cssVar(name, fallback) {
-  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+// CSS variables are resolved once and cached: getComputedStyle forces a style
+// recalculation, and cssVar() ran on every wire stroke, port and node label
+// (hundreds of calls per frame). The cache is refreshed on theme change.
+const _cssCache = new Map();
+export function cssVar(name, fallback) {
+  let v = _cssCache.get(name);
+  if (v === undefined) {
+    v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    _cssCache.set(name, v);
+  }
   return v || fallback;
 }
+
+export function refreshCssVars() { _cssCache.clear(); }
 
 const FONT = '600 11px "Segoe UI", sans-serif';
 
@@ -71,6 +81,12 @@ export function draw(ctx, engine, view, selection, hover, hoverPort = null) {
   const nodes = engine.getNodes();
   const values = engine.evaluate();
 
+  // Per-frame node box cache: every wire used to recompute longestText +
+  // nodeSize for both endpoints, and each node again when drawn. Compute
+  // once per frame and share.
+  const boxes = new Map();
+  for (const n of nodes) boxes.set(n.id, nodeBox(n, values));
+
   // wires first (under nodes)
   for (const n of nodes) {
     if (!n.inputs) continue;
@@ -80,14 +96,14 @@ export function draw(ctx, engine, view, selection, hover, hoverPort = null) {
       if (!src) return;
       const srcPort = n.sourcePorts ? n.sourcePorts[port] : 0;
       const active = outletValue(src, values, srcPort) === 1;
-      drawWire(ctx, src, srcPort, n, port, active, values);
+      drawWire(ctx, src, srcPort, n, port, active, boxes);
     });
   }
 
   // nodes
   for (const n of nodes) {
     const hp = hoverPort && hoverPort.node && hoverPort.node.id === n.id ? hoverPort : null;
-    drawNode(ctx, n, values, selection.has(n.id), hover === n.id, hp);
+    drawNode(ctx, n, values, selection.has(n.id), hover === n.id, hp, boxes);
   }
 
   ctx.restore();
@@ -105,9 +121,9 @@ function outletValue(node, values, srcPort = 0) {
   return 0;
 }
 
-function drawWire(ctx, src, srcPort, dst, port, active, values) {
-  const s = outputPortPos(src, srcPort, nodeBox(src, values).w / 2);
-  const d = inputPortPos(dst, port, nodeBox(dst, values).w / 2);
+function drawWire(ctx, src, srcPort, dst, port, active, boxes) {
+  const s = outputPortPos(src, srcPort, boxes.get(src.id).w / 2);
+  const d = inputPortPos(dst, port, boxes.get(dst.id).w / 2);
   const backward = s.x >= d.x - 8;
   ctx.beginPath();
   ctx.strokeStyle = active ? 'rgba(126,231,135,0.9)' : cssVar('--wire-dim', 'rgba(139,148,158,0.45)');
@@ -145,11 +161,11 @@ function drawWire(ctx, src, srcPort, dst, port, active, values) {
   }
 }
 
-function drawNode(ctx, node, values, selected, hover, hoverPort) {
+function drawNode(ctx, node, values, selected, hover, hoverPort, boxes) {
   const baseVar = cssVar(KIND_VARS[node.kind], COLORS[node.kind]) || cssVar('--node', '#8b949e');
   // per-instance color override (all kinds)
   const color = (node.color && /^#[0-9a-fA-F]{3,8}$/.test(node.color)) ? node.color : baseVar;
-  const { w, h } = nodeBox(node, values);
+  const { w, h } = boxes.get(node.id);
   const hw = w / 2, hh = h / 2;
 
   ctx.save();

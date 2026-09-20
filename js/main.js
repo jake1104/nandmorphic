@@ -1,7 +1,7 @@
 // Main entry point: wires engine, renderer, interactor, and UI.
 
 import { Engine, sameCircuitStructure, preservePortOrder } from './engine.js';
-import { draw } from './renderer.js';
+import { draw, refreshCssVars } from './renderer.js';
 import { Interactor } from './interact.js';
 import { NodeKind } from './model.js';
 import { buildDefinitionFromCircuit } from './encapsulate.js';
@@ -49,11 +49,12 @@ function render() {
   if (interactor) interactor.drawOverlay(ctx, view);
 }
 
-function setStatus(msg) { statusEl.textContent = msg; }
+function setStatus(msg) { if (statusEl.textContent !== msg) statusEl.textContent = msg; }
 
 function initInteractor() {
   interactor = new Interactor(engine, canvas, view, {
     onSelectionChange: () => updateToolbar(),
+    onWire: () => updateToolbar(),
     onStatus: setStatus,
     onOpenNode: openCustomNode,
     onInspectNode: inspectNode,
@@ -129,9 +130,43 @@ function addNode(kind) {
   render();
 }
 
+function allInputsConnected() {
+  if (!interactor) return false;
+  const sel = interactor.selection;
+  for (const id of sel) {
+    const n = engine.nodes.get(id);
+    if (!n || !n.inputs) continue;
+    for (const srcId of n.inputs) {
+      if (!srcId || !sel.has(srcId)) return false;
+    }
+  }
+  const closed = new Set();
+  for (const id of sel) {
+    const n = engine.nodes.get(id);
+    if (!n || !n.inputs) continue;
+    n.inputs.forEach((srcId, port) => {
+      if (!srcId) return;
+      closed.add(srcId + ':' + ((n.sourcePorts && n.sourcePorts[port]) | 0));
+    });
+  }
+  for (const n of engine.nodes.values()) {
+    if (!n.inputs || sel.has(n.id)) continue;
+    for (let i = 0; i < n.inputs.length; i++) {
+      const srcId = n.inputs[i];
+      if (!srcId || !sel.has(srcId)) continue;
+      if (!closed.has(srcId + ':' + ((n.sourcePorts && n.sourcePorts[i]) | 0))) return false;
+    }
+  }
+  return true;
+}
+
 function encapsulateSelection() {
   if (!interactor || interactor.selection.size === 0) {
     setStatus('select nodes to encapsulate');
+    return;
+  }
+  if (!allInputsConnected()) {
+    setStatus('selection must be a closed circuit');
     return;
   }
   const sel = Array.from(interactor.selection);
@@ -363,6 +398,7 @@ function refresh() {
 }
 
 function renderTabs() {
+  _lastTabSig = tabSig(); // keep the loop's skip-gate in sync with explicit rebuilds
   const tabsEl = document.getElementById('tabs');
   tabsEl.innerHTML = '';
   levels.forEach((f, i) => {
@@ -510,6 +546,7 @@ function inspectNode(node) {
     }
     engine.bump();
     closeModal();
+    updateToolbar();
     render();
   };
 }
@@ -618,7 +655,7 @@ function doClock() {
 function updateToolbar() {
   const run = engine.mode === 'run';
   const hasSel = interactor && interactor.selection.size > 0;
-  const disabled = run || !hasSel;
+  const disabled = run || !hasSel || !allInputsConnected();
   document.querySelector('[data-action="encapsulate"]').disabled = disabled;
   document.querySelector('[data-action="open-node"]').disabled = run || !(
     interactor && interactor.selection.size === 1 &&
@@ -911,6 +948,7 @@ function importWorkspace(file) {
 // Theme (dark default, light optional)
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
+  refreshCssVars(); // cached --wire/--port/--text colors must re-resolve
   try { localStorage.setItem('nandmorphic-theme', theme); } catch (e) {}
   const themeBtn = document.getElementById('theme-btn');
   if (themeBtn) {
@@ -1014,17 +1052,33 @@ function setClkFreq(v) {
   if (l) l.textContent = String(clkFreq);
 }
 
-// Render loop — in RUN mode auto-clock at clkFreq Hz
+// Render loop — in RUN mode auto-clock at clkFreq Hz.
+// Full redraws are skipped when nothing changed: engine.version bumps on
+// every state edit and the interactor raises needsRender when only its
+// visual state (hover/pan/wire/marquee/selection) moves. Idle frames now
+// cost one version comparison instead of a full canvas repaint.
 let lastAutoClock = 0;
-let _lastTabRenderVersion = -1;
+let _lastRenderVersion = -1;
+let _lastTabSig = null;
+function tabSig() {
+  // Cheap signature of tab-relevant state (titles, dirty flags, order) so
+  // renderTabs isn't rebuilt on every drag frame (bumpLight bumps version).
+  let s = String(activeLevel);
+  for (let i = 0; i < levels.length; i++) {
+    const f = levels[i];
+    const dirty = (i === activeLevel) ? isLevelDirty() : f.dirty;
+    s += '|' + levelTitle(i) + ':' + (dirty ? 1 : 0);
+  }
+  return s;
+}
 function loop(ts) {
   const now = ts || performance.now();
-  render();
-  // Re-render tabs when engine state changes (dirty indicator, etc.)
-  if (engine.version !== _lastTabRenderVersion) {
-    _lastTabRenderVersion = engine.version;
-    renderTabs();
+  if (engine.version !== _lastRenderVersion || (interactor && interactor.needsRender)) {
+    _lastRenderVersion = engine.version;
+    if (interactor) interactor.needsRender = false;
+    render();
   }
+  if (tabSig() !== _lastTabSig) renderTabs();
   const interval = 1000 / clkFreq;
   if (engine.mode === 'run' && now - lastAutoClock >= interval) {
     lastAutoClock = now;

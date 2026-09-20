@@ -10,13 +10,8 @@
 //   - Delete key removes selected nodes
 
 import { NodeKind } from './model.js';
-import { nodeAt, outputPortAt, inputPortAt, NODE_HIT_R, nodeBox } from './renderer.js';
+import { nodeAt, outputPortAt, inputPortAt, NODE_HIT_R, nodeBox, cssVar } from './renderer.js';
 import { inputPortPos, outputPortPos, inputPortCount, outputPortCount } from './ports.js';
-
-function cssVar(name, fallback) {
-  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  return v || fallback;
-}
 
 export class Interactor {
   constructor(engine, canvas, view, hooks) {
@@ -37,6 +32,7 @@ export class Interactor {
     this.hover = null; // hovered node id (body)
     this.hoverPort = null; // { node, dir:'in'|'out', port }
     this.panStart = null; // { sx, sy, vx, vy } for middle-click pan
+    this.needsRender = false; // canvas needs a redraw (set by handlers, cleared by the render loop)
   }
 
   screenToWorld(sx, sy) {
@@ -110,6 +106,7 @@ export class Interactor {
       const srcNode = this.engine.nodes.get(srcId);
       inHit.node.inputs[inHit.port] = null;
       this.engine.bump();
+      if (this.hooks.onWire) this.hooks.onWire(null, inHit.node, inHit.port);
       this.mode = 'wire';
       this.wire = { srcNode: srcNode || null, srcPort: -1, reroute: { dst: inHit.node, port: inHit.port } };
       this.wireCursor = p;
@@ -152,6 +149,7 @@ export class Interactor {
       this.view.x = this.panStart.vx - dx / this.view.zoom;
       this.view.y = this.panStart.vy - dy / this.view.zoom;
       this.canvas.style.cursor = 'grabbing';
+      this.needsRender = true; // pan mutates the view; the loop is its only redraw path
       return;
     }
 
@@ -164,6 +162,7 @@ export class Interactor {
         this.hoverPort = this.snapTarget ? { node: this.snapTarget.node, dir: 'in', port: this.snapTarget.port } : null;
       }
       this.hover = null;
+      this.needsRender = true;
       return;
     }
 
@@ -184,6 +183,7 @@ export class Interactor {
       }
       this.engine.bumpLight();
       this.hover = this.dragNode.id;
+      this.needsRender = true;
       return;
     }
 
@@ -191,11 +191,17 @@ export class Interactor {
       this.marquee.x1 = p.x;
       this.marquee.y1 = p.y;
       this.hover = null;
+      this.needsRender = true;
       return;
     }
 
     // idle: update hover state (node body or port). Ports straddle the body
     // edge, so scan every node for a port hit (works slightly off-body too).
+    // The render loop only redraws when hover actually changes, so compare
+    // against the previous state (by value — hoverPort is a fresh object
+    // each pass).
+    const prevHover = this.hover;
+    const prevPort = this.hoverPort;
     const val2 = this.engine.evaluate();
     const node = nodeAt(nodes, val2, p.x, p.y);
     this.hover = node ? node.id : null;
@@ -207,6 +213,10 @@ export class Interactor {
       if (ip >= 0) { this.hoverPort = { node: n, dir: 'in', port: ip }; break; }
     }
     this.canvas.style.cursor = this.hoverPort ? 'pointer' : (this.hover ? 'grab' : 'default');
+    const portChanged = (this.hoverPort === null) !== (prevPort === null) ||
+      (this.hoverPort !== null && prevPort !== null &&
+        (this.hoverPort.node !== prevPort.node || this.hoverPort.dir !== prevPort.dir || this.hoverPort.port !== prevPort.port));
+    if (this.hover !== prevHover || portChanged) this.needsRender = true;
   }
 
   onPointerUp(e) {
@@ -325,6 +335,7 @@ export class Interactor {
       // re-routing an existing connection: new source -> original input
       if (source) {
         this.engine.connect(source.node.id, wire.reroute.dst.id, wire.reroute.port, source.port);
+        if (this.hooks.onWire) this.hooks.onWire(source.node, wire.reroute.dst, wire.reroute.port);
       }
       // else: dropped into empty space -> connection stays removed (disconnect)
       return;
@@ -353,6 +364,7 @@ export class Interactor {
   }
 
   emitSelection() {
+    this.needsRender = true; // selection stroke is drawn on the canvas
     if (this.hooks.onSelectionChange) this.hooks.onSelectionChange(this.selection);
   }
 
